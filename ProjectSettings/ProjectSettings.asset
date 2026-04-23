@@ -13,7 +13,7 @@ PlayerSettings:
   useOnDemandResources: 0
   accelerometerFrequency: 60
   companyName: Lakshya02
-  productName: ScanSpace
+  productName: Scan Space
   defaultCursor: {fileID: 0}
   cursorHotspot: {x: 0, y: 0}
   m_SplashScreenBackgroundColor: {r: 0.13725491, g: 0.12156863, b: 0.1254902, a: 1}
@@ -849,7 +849,7 @@ PlayerSettings:
   editorAssembliesCompatibilityLevel: 1
   m_RenderingPath: 1
   m_MobileRenderingPath: 1
-  metroPackageName: ScanSpace
+  metroPackageName: Scan Space
   metroPackageVersion: 
   metroCertificatePath: 
   metroCertificatePassword: 
@@ -930,7 +930,7 @@ PlayerSettings:
   cloudProjectId: 1f042a5a-36ab-4894-91e2-a69c0e194d0d
   framebufferDepthMemorylessMode: 0
   qualitySettingsNames: []
-  projectName: ScanSpace
+  projectName: Scan Space
   organizationId: lakshya_02
   cloudEnabled: 0
   legacyClampBlendShapeWeights: 0
