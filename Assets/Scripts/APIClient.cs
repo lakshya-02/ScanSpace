@@ -1,11 +1,14 @@
 using UnityEngine;
 using UnityEngine.Networking;
 using TMPro;
+using System;
 using System.Collections;
 using System.Threading.Tasks;
 
 public class APIClient : MonoBehaviour
 {
+    public event Action<string> StatusChanged;
+
     [Header("References")]
     [SerializeField] private ServerConfig config;
     [SerializeField] private ModelLoader modelLoader;
@@ -16,23 +19,26 @@ public class APIClient : MonoBehaviour
     [SerializeField] private int timeoutSeconds = 60;
 
     private bool _isSending;
+    public bool IsSending => _isSending;
 
     private void Awake()
     {
         ResolveReferences();
     }
 
-    public void SendImage(Texture2D texture)
+    public void SendImage(Texture2D texture, Action<bool> onCompleted = null)
     {
         if (texture == null)
         {
             Debug.LogError("[APIClient] Cannot send a null texture.");
+            onCompleted?.Invoke(false);
             return;
         }
 
         if (!HasRequiredReferences())
         {
             Destroy(texture);
+            onCompleted?.Invoke(false);
             return;
         }
 
@@ -40,13 +46,14 @@ public class APIClient : MonoBehaviour
         {
             Debug.LogWarning("[APIClient] Already sending a request. Ignoring.");
             Destroy(texture);
+            onCompleted?.Invoke(false);
             return;
         }
 
-        StartCoroutine(SendImageCoroutine(texture));
+        StartCoroutine(SendImageCoroutine(texture, onCompleted));
     }
 
-    private IEnumerator SendImageCoroutine(Texture2D texture)
+    private IEnumerator SendImageCoroutine(Texture2D texture, Action<bool> onCompleted)
     {
         _isSending = true;
         SetStatus("Preparing capture...");
@@ -71,8 +78,7 @@ public class APIClient : MonoBehaviour
 
                 SetStatus(healthError);
                 Debug.LogError($"[APIClient] {healthError}");
-                SetLoading(false);
-                _isSending = false;
+                CompleteRequest(false, onCompleted);
                 yield break;
             }
         }
@@ -96,8 +102,7 @@ public class APIClient : MonoBehaviour
                 string errorMsg = BuildRequestError("Generate failed", generateRequest);
                 SetStatus(errorMsg);
                 Debug.LogError($"[APIClient] Generate failed - {errorMsg}");
-                SetLoading(false);
-                _isSending = false;
+                CompleteRequest(false, onCompleted);
                 yield break;
             }
 
@@ -108,8 +113,7 @@ public class APIClient : MonoBehaviour
                 string responseBody = generateRequest.downloadHandler?.text;
                 SetStatus("Server response was not a GLB file.");
                 Debug.LogError($"[APIClient] Generate succeeded but response was not GLB. Body: {responseBody}");
-                SetLoading(false);
-                _isSending = false;
+                CompleteRequest(false, onCompleted);
                 yield break;
             }
 
@@ -122,24 +126,28 @@ public class APIClient : MonoBehaviour
                 string exceptionMessage = loadTask.Exception?.GetBaseException().Message ?? "Unknown model load failure.";
                 SetStatus($"Model load failed: {exceptionMessage}");
                 Debug.LogError($"[APIClient] Model load failed: {exceptionMessage}");
-                SetLoading(false);
-                _isSending = false;
+                CompleteRequest(false, onCompleted);
                 yield break;
             }
 
             if (!loadTask.Result)
             {
                 SetStatus("Model load failed.");
-                SetLoading(false);
-                _isSending = false;
+                CompleteRequest(false, onCompleted);
                 yield break;
             }
 
             SetStatus("Model loaded!");
         }
 
+        CompleteRequest(true, onCompleted);
+    }
+
+    private void CompleteRequest(bool success, Action<bool> onCompleted)
+    {
         SetLoading(false);
         _isSending = false;
+        onCompleted?.Invoke(success);
     }
 
     private static IEnumerator WaitForTask(Task task)
@@ -176,6 +184,7 @@ public class APIClient : MonoBehaviour
         if (statusText != null)
             statusText.text = message;
 
+        StatusChanged?.Invoke(message);
         Debug.Log($"[APIClient] {message}");
     }
 
