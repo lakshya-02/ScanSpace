@@ -165,3 +165,7 @@ cython_debug/
 
 stabilityai/
 output/
+model.glb
+output/cache/
+output/tmp/
+*.meta

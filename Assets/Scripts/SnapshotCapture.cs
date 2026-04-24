@@ -1,5 +1,6 @@
 using UnityEngine;
 using Meta.XR;
+using System.IO;
 
 public class SnapshotCapture : MonoBehaviour
 {
@@ -7,7 +8,14 @@ public class SnapshotCapture : MonoBehaviour
     [SerializeField] private APIClient apiClient;
     [SerializeField] private PassthroughCameraAccess passthroughCamera;
 
+    [Header("Capture Flow")]
+    [SerializeField] private bool autoUploadAfterCapture = false;
+    [SerializeField] private bool saveCaptureToDisk = true;
+    [SerializeField] private string captureFolderName = "QuestCaptures";
+    [SerializeField] private KeyCode editorTestKey = KeyCode.C;
+
     private bool _capturing;
+    public string LastCapturePath { get; private set; }
 
     private void Awake()
     {
@@ -18,8 +26,11 @@ public class SnapshotCapture : MonoBehaviour
     {
         if (_capturing) return;
 
-        // A button on right controller
-        if (OVRInput.GetDown(OVRInput.Button.One, OVRInput.Controller.RTouch))
+        bool capturePressed =
+            OVRInput.GetDown(OVRInput.Button.One, OVRInput.Controller.RTouch) ||
+            Input.GetKeyDown(editorTestKey);
+
+        if (capturePressed)
         {
             CaptureSnapshot();
         }
@@ -29,15 +40,15 @@ public class SnapshotCapture : MonoBehaviour
     {
         ResolveReferences();
 
-        if (apiClient == null)
-        {
-            Debug.LogError("[SnapshotCapture] APIClient reference is not assigned.");
-            return;
-        }
-
         if (passthroughCamera == null)
         {
             Debug.LogError("[SnapshotCapture] PassthroughCameraAccess reference is not assigned.");
+            return;
+        }
+
+        if (autoUploadAfterCapture && apiClient == null)
+        {
+            Debug.LogError("[SnapshotCapture] APIClient reference is not assigned, but auto upload is enabled.");
             return;
         }
 
@@ -77,8 +88,19 @@ public class SnapshotCapture : MonoBehaviour
             RenderTexture.active = prev;
             RenderTexture.ReleaseTemporary(rt);
 
-            Debug.Log($"[SnapshotCapture] Sending capture {texture.width}x{texture.height} to APIClient.");
-            apiClient.SendImage(texture);
+            if (saveCaptureToDisk)
+                LastCapturePath = SaveTextureToDisk(texture);
+
+            if (autoUploadAfterCapture)
+            {
+                Debug.Log($"[SnapshotCapture] Sending capture {texture.width}x{texture.height} to APIClient.");
+                apiClient.SendImage(texture);
+            }
+            else
+            {
+                Debug.Log("[SnapshotCapture] Capture stored locally. Auto upload is disabled.");
+                Destroy(texture);
+            }
         }
         catch (System.Exception e)
         {
@@ -97,5 +119,19 @@ public class SnapshotCapture : MonoBehaviour
 
         if (passthroughCamera == null)
             passthroughCamera = FindFirstObjectByType<PassthroughCameraAccess>();
+    }
+
+    private string SaveTextureToDisk(Texture2D texture)
+    {
+        string directory = Path.Combine(Application.persistentDataPath, captureFolderName);
+        Directory.CreateDirectory(directory);
+
+        string fileName = $"capture_{System.DateTime.Now:yyyyMMdd_HHmmss}.jpg";
+        string fullPath = Path.Combine(directory, fileName);
+        byte[] jpgBytes = texture.EncodeToJPG(90);
+        File.WriteAllBytes(fullPath, jpgBytes);
+
+        Debug.Log($"[SnapshotCapture] Capture saved to: {fullPath}");
+        return fullPath;
     }
 }

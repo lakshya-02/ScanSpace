@@ -3,19 +3,33 @@ using UnityEngine;
 [CreateAssetMenu(fileName = "ServerConfig", menuName = "Config/ServerConfig")]
 public class ServerConfig : ScriptableObject
 {
-    [Header("SF3D Server Settings")]
-    [Tooltip("LAN IP address of the PC running the Stable Fast 3D FastAPI server")]
-    public string serverIP = "192.168.1.100";
+    [Header("API Gateway")]
+    [Tooltip("Public API base URL. Can be a Cloudflare Tunnel HTTPS URL or local LAN URL.")]
+    public string baseUrl = "http://192.168.1.100:8000";
 
-    [Header("Ports")]
-    [Tooltip("Port used by the FastAPI server for generation requests")]
-    public int uploadPort = 8000;
+    [Tooltip("Health endpoint path exposed by the API gateway.")]
+    public string healthPath = "/health";
 
-    [Tooltip("Legacy secondary port. Keep equal to uploadPort unless you have a custom server.")]
-    public int downloadPort = 8000;
+    [Tooltip("Generation endpoint path exposed by the API gateway.")]
+    public string generatePath = "/generate";
 
-    public string UploadURL => $"http://{serverIP}:{uploadPort}";
-    public string DownloadURL => $"http://{serverIP}:{downloadPort}";
-    public string GenerateURL => $"{UploadURL}/generate";
-    public string HealthURL => $"{UploadURL}/health";
+    [Header("Auth")]
+    [Tooltip("Optional bearer token for the gateway. Leave blank for local development.")]
+    public string bearerToken = "";
+
+    public string HealthURL => CombineUrl(baseUrl, healthPath);
+    public string GenerateURL => CombineUrl(baseUrl, generatePath);
+
+    public bool HasBearerToken => !string.IsNullOrWhiteSpace(bearerToken);
+
+    private static string CombineUrl(string root, string path)
+    {
+        string normalizedRoot = (root ?? string.Empty).Trim().TrimEnd('/');
+        string normalizedPath = string.IsNullOrWhiteSpace(path) ? string.Empty : path.Trim();
+
+        if (!normalizedPath.StartsWith("/"))
+            normalizedPath = "/" + normalizedPath;
+
+        return normalizedRoot + normalizedPath;
+    }
 }

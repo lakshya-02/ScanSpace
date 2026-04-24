@@ -60,6 +60,7 @@ public class APIClient : MonoBehaviour
         using (var healthRequest = UnityWebRequest.Get(config.HealthURL))
         {
             healthRequest.timeout = 10;
+            ApplyAuthHeader(healthRequest);
             Debug.Log($"[APIClient] Health check -> {config.HealthURL}");
             yield return healthRequest.SendWebRequest();
 
@@ -85,6 +86,7 @@ public class APIClient : MonoBehaviour
         using (var generateRequest = UnityWebRequest.Post(config.GenerateURL, form))
         {
             generateRequest.timeout = timeoutSeconds;
+            ApplyAuthHeader(generateRequest);
             Debug.Log($"[APIClient] Generate request -> {config.GenerateURL}");
 
             yield return generateRequest.SendWebRequest();
@@ -190,6 +192,14 @@ public class APIClient : MonoBehaviour
 
         if (config == null)
             config = Resources.Load<ServerConfig>("ServerConfig");
+    }
+
+    private void ApplyAuthHeader(UnityWebRequest request)
+    {
+        if (request == null || config == null || !config.HasBearerToken)
+            return;
+
+        request.SetRequestHeader("Authorization", $"Bearer {config.bearerToken.Trim()}");
     }
 
     private bool HasRequiredReferences()

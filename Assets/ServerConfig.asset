@@ -12,6 +12,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 1c1a009730eab5045a07937013467578, type: 3}
   m_Name: ServerConfig
   m_EditorClassIdentifier: 
-  serverIP: 10.1.87.211
-  uploadPort: 8000
-  downloadPort: 8000
+  baseUrl: https://api.scanspace.app
+  healthPath: /health
+  generatePath: /generate
+  bearerToken: 

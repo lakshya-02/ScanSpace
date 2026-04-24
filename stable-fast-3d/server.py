@@ -1,43 +1,82 @@
 """
-FastAPI server for Stable Fast 3D model.
-Receives an image and returns a 3D GLB model.
+Scan Space Stable Fast 3D backend.
 
-Usage:
-    python server.py
+Compatible with the current Unity client:
+- GET /health
+- POST /generate
+- POST /generate/base64
 
-The server will run on http://0.0.0.0:8000
+Environment variables:
+- SF3D_PROFILE=auto|lite|full
+- SCANSPACE_HOST=0.0.0.0
+- SCANSPACE_PORT=8000
+- SCANSPACE_ALLOW_ORIGINS=*
+- SCANSPACE_API_TOKEN=<optional bearer token>
+- SCANSPACE_CACHE_ENABLED=true|false
+- SCANSPACE_CACHE_DIR=<optional cache directory>
+- SCANSPACE_MAX_UPLOAD_MB=50
 """
 
+import asyncio
+import base64
+import hmac
 import io
+import json
 import os
 import socket
 import tempfile
 import time
 from contextlib import asynccontextmanager, nullcontext
+from hashlib import sha256
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 import rembg
 import torch
-from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import JSONResponse
 from PIL import Image
 
 import sf3d.utils as sf3d_utils
 from sf3d.system import SF3D
 
-# Constants
+# Image and camera conditioning constants.
 COND_WIDTH = 512
 COND_HEIGHT = 512
 COND_DISTANCE = 1.6
 COND_FOVY_DEG = 40
 BACKGROUND_COLOR = [0.5, 0.5, 0.5]
-MAX_UPLOAD_SIZE_MB = 50  # 50MB max for camera images
 
 PROFILE_AUTO = "auto"
 PROFILE_LITE = "lite"
 PROFILE_FULL = "full"
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+MAX_UPLOAD_SIZE_MB = int(os.getenv("SCANSPACE_MAX_UPLOAD_MB", "50"))
+MAX_UPLOAD_SIZE_BYTES = MAX_UPLOAD_SIZE_MB * 1024 * 1024
+HOST = os.getenv("SCANSPACE_HOST", "0.0.0.0").strip() or "0.0.0.0"
+PORT = int(os.getenv("SCANSPACE_PORT", "8000"))
+EXPECTED_BEARER_TOKEN = (
+    os.getenv("SCANSPACE_API_TOKEN", "") or os.getenv("SCANSPACE_BEARER_TOKEN", "")
+).strip()
+
+
+def env_flag(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def split_origins() -> list[str]:
+    raw_value = os.getenv("SCANSPACE_ALLOW_ORIGINS", "*").strip()
+    if raw_value == "*" or not raw_value:
+        return ["*"]
+
+    origins = [origin.strip() for origin in raw_value.split(",") if origin.strip()]
+    return origins or ["*"]
 
 
 def detect_runtime_profile() -> str:
@@ -62,8 +101,12 @@ def get_profile_defaults(profile: str) -> tuple[int, int]:
 
 RUNTIME_PROFILE = detect_runtime_profile()
 DEFAULT_TEXTURE_SIZE, DEFAULT_VERTEX_COUNT = get_profile_defaults(RUNTIME_PROFILE)
+CACHE_ENABLED = env_flag("SCANSPACE_CACHE_ENABLED", True)
+CACHE_DIR = Path(
+    os.getenv("SCANSPACE_CACHE_DIR", str(PROJECT_ROOT / "output" / "cache"))
+).resolve()
 
-# Global model and session references
+# Global model/session references loaded once at startup.
 model = None
 rembg_session = None
 device = None
@@ -71,34 +114,66 @@ c2w_cond = None
 intrinsic = None
 intrinsic_normed_cond = None
 
+generation_lock = asyncio.Lock()
+metrics = {
+    "requests_total": 0,
+    "requests_inflight": 0,
+    "generate_requests_total": 0,
+    "successful_generations": 0,
+    "failed_generations": 0,
+    "cache_hits": 0,
+    "cache_misses": 0,
+    "last_generation_seconds": None,
+    "last_error": None,
+    "last_request_hash": None,
+}
+
 
 def get_lan_ip() -> str:
     """Get the LAN IP address of this machine."""
     try:
-        # Connect to external address to determine local IP
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.connect(("8.8.8.8", 80))
+        ip = sock.getsockname()[0]
+        sock.close()
         return ip
     except Exception:
         return "127.0.0.1"
 
 
+def get_gpu_info() -> dict[str, Any]:
+    if not torch.cuda.is_available():
+        return {"available": False}
+
+    props = torch.cuda.get_device_properties(0)
+    return {
+        "available": True,
+        "name": props.name,
+        "total_vram_gb": round(props.total_memory / (1024**3), 2),
+    }
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Load the model on startup and clean up on shutdown."""
+    """Load the model on startup and prepare cache directories."""
     global model, rembg_session, device, c2w_cond, intrinsic, intrinsic_normed_cond
 
-    print("Loading SF3D model...")
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    print("Loading Scan Space Stable Fast 3D backend...")
     device = sf3d_utils.get_device()
     print(f"Using device: {device}")
-    if torch.cuda.is_available():
-        total_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-        print(f"Detected VRAM: {total_vram_gb:.1f} GB")
-    print(f"Selected profile: {RUNTIME_PROFILE.upper()}")
 
-    # Load model
+    gpu_info = get_gpu_info()
+    if gpu_info["available"]:
+        print(f"Detected GPU: {gpu_info['name']}")
+        print(f"Detected VRAM: {gpu_info['total_vram_gb']:.1f} GB")
+
+    print(f"Selected profile: {RUNTIME_PROFILE.upper()}")
+    print(f"Cache enabled: {CACHE_ENABLED}")
+    print(f"Cache directory: {CACHE_DIR}")
+    print(f"Auth enabled: {bool(EXPECTED_BEARER_TOKEN)}")
+
     model = SF3D.from_pretrained(
         "stabilityai/stable-fast-3d",
         config_name="config.yaml",
@@ -107,49 +182,49 @@ async def lifespan(app: FastAPI):
     model.eval()
     model = model.to(device)
 
-    # Initialize rembg session
     rembg_session = rembg.new_session()
-
-    # Pre-compute camera parameters (cached, doesn't change)
     c2w_cond = sf3d_utils.default_cond_c2w(COND_DISTANCE)
     intrinsic, intrinsic_normed_cond = sf3d_utils.create_intrinsic_from_fov_deg(
         COND_FOVY_DEG, COND_HEIGHT, COND_WIDTH
     )
 
-    print("Model loaded successfully!")
-
-    # Print LAN URL for easy testing
     lan_ip = get_lan_ip()
-    print("\n" + "=" * 50)
-    print("Server ready! Access from Quest 3 using:")
-    print(f"  Health check: http://{lan_ip}:8000/health")
-    print(f"  Generate:     http://{lan_ip}:8000/generate")
-    print(f"  API docs:     http://{lan_ip}:8000/docs")
-    print("-" * 50)
-    print(f"  MODE: {RUNTIME_PROFILE.upper()}")
-    print(f"  Texture: {DEFAULT_TEXTURE_SIZE}, Vertices: {DEFAULT_VERTEX_COUNT}")
-    print("=" * 50 + "\n")
+    print("\n" + "=" * 58)
+    print("Scan Space backend ready")
+    print(f"  Health:   http://{lan_ip}:{PORT}/health")
+    print(f"  Generate: http://{lan_ip}:{PORT}/generate")
+    print(f"  Docs:     http://{lan_ip}:{PORT}/docs")
+    print("-" * 58)
+    print(f"  Mode:          {RUNTIME_PROFILE.upper()}")
+    print(f"  Texture size:  {DEFAULT_TEXTURE_SIZE}")
+    print(f"  Vertex count:  {DEFAULT_VERTEX_COUNT}")
+    print("=" * 58 + "\n")
 
     yield
 
-    # Cleanup
-    print("Shutting down...")
+    print("Shutting down Scan Space backend...")
 
 
 app = FastAPI(
-    title="Stable Fast 3D API",
-    description="API for generating 3D models from images using Stable Fast 3D",
-    version="1.0.0",
+    title="Scan Space Stable Fast 3D API",
+    description="Quest-ready Stable Fast 3D API for Scan Space",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
-# Add CORS middleware for Unity WebGL or other cross-origin requests
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins for local development
+    allow_origins=split_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=[
+        "Content-Disposition",
+        "X-ScanSpace-Cache",
+        "X-ScanSpace-Request-Hash",
+        "X-ScanSpace-Profile",
+        "X-ScanSpace-Duration",
+    ],
 )
 
 
@@ -158,10 +233,12 @@ async def log_requests(request: Request, call_next):
     """Log all requests with client IP, endpoint, duration, and status."""
     start_time = time.time()
     client_ip = request.client.host if request.client else "unknown"
+    metrics["requests_total"] += 1
+    metrics["requests_inflight"] += 1
 
-    # Check upload size before processing
     content_length = request.headers.get("content-length")
-    if content_length and int(content_length) > MAX_UPLOAD_SIZE_MB * 1024 * 1024:
+    if content_length and int(content_length) > MAX_UPLOAD_SIZE_BYTES:
+        metrics["requests_inflight"] -= 1
         print(f"[{client_ip}] {request.method} {request.url.path} - REJECTED (file too large)")
         return JSONResponse(
             status_code=413,
@@ -171,16 +248,37 @@ async def log_requests(request: Request, call_next):
     try:
         response = await call_next(request)
         duration = time.time() - start_time
-        print(f"[{client_ip}] {request.method} {request.url.path} - {response.status_code} ({duration:.2f}s)")
+        print(
+            f"[{client_ip}] {request.method} {request.url.path} "
+            f"- {response.status_code} ({duration:.2f}s)"
+        )
         return response
-    except Exception as e:
+    except Exception as exc:
         duration = time.time() - start_time
-        print(f"[{client_ip}] {request.method} {request.url.path} - ERROR ({duration:.2f}s): {e}")
+        metrics["last_error"] = str(exc)
+        print(
+            f"[{client_ip}] {request.method} {request.url.path} "
+            f"- ERROR ({duration:.2f}s): {exc}"
+        )
         raise
+    finally:
+        metrics["requests_inflight"] = max(0, metrics["requests_inflight"] - 1)
+
+
+def require_bearer_token(request: Request) -> None:
+    if not EXPECTED_BEARER_TOKEN:
+        return
+
+    authorization = request.headers.get("Authorization", "").strip()
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not hmac.compare_digest(
+        token.strip(), EXPECTED_BEARER_TOKEN
+    ):
+        raise HTTPException(status_code=401, detail="Missing or invalid bearer token")
 
 
 def create_batch(input_image: Image.Image) -> dict[str, Any]:
-    """Create model input batch from PIL Image."""
+    """Create model input batch from a processed RGBA image."""
     img_cond = (
         torch.from_numpy(
             np.asarray(input_image.resize((COND_WIDTH, COND_HEIGHT))).astype(np.float32)
@@ -201,80 +299,257 @@ def create_batch(input_image: Image.Image) -> dict[str, Any]:
         "intrinsic_cond": intrinsic.unsqueeze(0),
         "intrinsic_normed_cond": intrinsic_normed_cond.unsqueeze(0),
     }
-    # Add batch dim
-    batched = {k: v.unsqueeze(0) for k, v in batch_elem.items()}
-    return batched
+    return {key: value.unsqueeze(0) for key, value in batch_elem.items()}
 
 
 def process_image(image: Image.Image, foreground_ratio: float) -> Image.Image:
-    """Remove background and resize foreground."""
-    # Remove background
+    """Remove the background and resize the foreground for SF3D."""
     image_rgba = sf3d_utils.remove_background(image.convert("RGBA"), rembg_session)
-    # Resize foreground
-    image_processed = sf3d_utils.resize_foreground(
+    return sf3d_utils.resize_foreground(
         image_rgba, foreground_ratio, out_size=(COND_WIDTH, COND_HEIGHT)
     )
-    return image_processed
 
 
-def generate_mesh(
+def generate_mesh_bytes(
     input_image: Image.Image,
-    texture_size: int = 1024,
-    remesh_option: str = "none",
-    vertex_count: int = -1,
-) -> str:
-    """Generate 3D mesh from image and return path to GLB file."""
+    texture_size: int,
+    remesh_option: str,
+    vertex_count: int,
+) -> bytes:
+    """Generate a 3D mesh and return the GLB bytes."""
     start = time.time()
+    device_name = str(device)
+
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
 
     with torch.no_grad():
         with (
-            torch.autocast(device_type=device, dtype=torch.bfloat16)
-            if "cuda" in device
+            torch.autocast(device_type=device_name, dtype=torch.bfloat16)
+            if "cuda" in device_name
             else nullcontext()
         ):
             model_batch = create_batch(input_image)
-            model_batch = {k: v.to(device) for k, v in model_batch.items()}
+            model_batch = {key: value.to(device) for key, value in model_batch.items()}
             trimesh_mesh, _glob_dict = model.generate_mesh(
                 model_batch, texture_size, remesh_option, vertex_count
             )
             trimesh_mesh = trimesh_mesh[0]
 
-    # Export to temporary GLB file
-    tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".glb")
-    trimesh_mesh.export(tmp_file.name, file_type="glb", include_normals=True)
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".glb") as tmp_file:
+        tmp_path = Path(tmp_file.name)
 
-    print(f"Generation took: {time.time() - start:.2f}s")
+    try:
+        trimesh_mesh.export(tmp_path, file_type="glb", include_normals=True)
+        glb_bytes = tmp_path.read_bytes()
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
 
     if torch.cuda.is_available():
-        print(f"Peak Memory: {torch.cuda.max_memory_allocated() / 1024 / 1024:.2f} MB")
+        peak_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
+        print(f"Peak Memory: {peak_mb:.2f} MB")
 
-    return tmp_file.name
+    duration = time.time() - start
+    print(f"Generation took: {duration:.2f}s")
+    return glb_bytes
+
+
+def read_uploaded_image(contents: bytes) -> Image.Image:
+    try:
+        image = Image.open(io.BytesIO(contents))
+        image.load()
+        return image
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid image payload: {exc}") from exc
+
+
+def normalize_generation_settings(
+    texture_size: int | None,
+    vertex_count: int | None,
+) -> tuple[int, int]:
+    normalized_texture_size = texture_size or DEFAULT_TEXTURE_SIZE
+    normalized_vertex_count = DEFAULT_VERTEX_COUNT if vertex_count is None else vertex_count
+    return normalized_texture_size, normalized_vertex_count
+
+
+def compute_request_hash(
+    image_bytes: bytes,
+    foreground_ratio: float,
+    texture_size: int,
+    remesh_option: str,
+    vertex_count: int,
+) -> str:
+    payload = json.dumps(
+        {
+            "foreground_ratio": foreground_ratio,
+            "texture_size": texture_size,
+            "remesh_option": remesh_option,
+            "vertex_count": vertex_count,
+            "profile": RUNTIME_PROFILE,
+        },
+        sort_keys=True,
+    ).encode("utf-8")
+
+    digest = sha256()
+    digest.update(payload)
+    digest.update(image_bytes)
+    return digest.hexdigest()
+
+
+def get_cache_path(request_hash: str) -> Path:
+    return CACHE_DIR / f"{request_hash}.glb"
+
+
+def load_cached_glb(request_hash: str) -> bytes | None:
+    if not CACHE_ENABLED:
+        return None
+
+    cache_path = get_cache_path(request_hash)
+    if not cache_path.exists():
+        return None
+
+    metrics["cache_hits"] += 1
+    return cache_path.read_bytes()
+
+
+def save_cached_glb(request_hash: str, glb_bytes: bytes) -> None:
+    if not CACHE_ENABLED:
+        return
+
+    cache_path = get_cache_path(request_hash)
+    if cache_path.exists():
+        return
+
+    tmp_path = cache_path.with_suffix(".tmp")
+    tmp_path.write_bytes(glb_bytes)
+    tmp_path.replace(cache_path)
+
+
+def build_response_headers(
+    cached: bool,
+    request_hash: str,
+    duration_seconds: float,
+) -> dict[str, str]:
+    return {
+        "Content-Disposition": "attachment; filename=model.glb",
+        "Access-Control-Expose-Headers": "Content-Disposition",
+        "X-ScanSpace-Cache": "hit" if cached else "miss",
+        "X-ScanSpace-Request-Hash": request_hash,
+        "X-ScanSpace-Profile": RUNTIME_PROFILE,
+        "X-ScanSpace-Duration": f"{duration_seconds:.3f}",
+    }
+
+
+async def get_glb_bytes(
+    image_bytes: bytes,
+    foreground_ratio: float,
+    texture_size: int,
+    remesh_option: str,
+    vertex_count: int,
+) -> tuple[bytes, str, bool, float]:
+    request_hash = compute_request_hash(
+        image_bytes, foreground_ratio, texture_size, remesh_option, vertex_count
+    )
+    metrics["last_request_hash"] = request_hash
+
+    request_start = time.time()
+    cached_glb = load_cached_glb(request_hash)
+    if cached_glb is not None:
+        duration_seconds = time.time() - request_start
+        metrics["last_generation_seconds"] = round(duration_seconds, 3)
+        return cached_glb, request_hash, True, duration_seconds
+
+    metrics["cache_misses"] += 1
+
+    async with generation_lock:
+        cached_glb = load_cached_glb(request_hash)
+        if cached_glb is not None:
+            duration_seconds = time.time() - request_start
+            metrics["last_generation_seconds"] = round(duration_seconds, 3)
+            return cached_glb, request_hash, True, duration_seconds
+
+        def run_pipeline() -> bytes:
+            input_image = read_uploaded_image(image_bytes)
+            processed_image = process_image(input_image, foreground_ratio)
+            return generate_mesh_bytes(
+                processed_image,
+                texture_size=texture_size,
+                remesh_option=remesh_option,
+                vertex_count=vertex_count,
+            )
+
+        glb_bytes = await asyncio.to_thread(run_pipeline)
+        save_cached_glb(request_hash, glb_bytes)
+
+    duration_seconds = time.time() - request_start
+    metrics["last_generation_seconds"] = round(duration_seconds, 3)
+    return glb_bytes, request_hash, False, duration_seconds
+
+
+async def validate_upload(image: UploadFile) -> bytes:
+    if not image.content_type or not image.content_type.startswith("image/"):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid file type. Upload an image such as PNG or JPEG.",
+        )
+
+    contents = await image.read()
+    if not contents:
+        raise HTTPException(status_code=400, detail="Uploaded image is empty.")
+
+    if len(contents) > MAX_UPLOAD_SIZE_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large. Max size is {MAX_UPLOAD_SIZE_MB} MB.",
+        )
+
+    return contents
 
 
 @app.get("/")
 async def root():
-    """Health check endpoint."""
     return {
         "status": "ok",
-        "message": "Stable Fast 3D API is running",
+        "service": "Scan Space Stable Fast 3D API",
+        "profile": RUNTIME_PROFILE,
         "device": device,
     }
 
 
 @app.get("/health")
 async def health():
-    """Health check endpoint for Quest 3 connectivity testing."""
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "service": "Scan Space Stable Fast 3D API",
+        "profile": RUNTIME_PROFILE,
+        "defaults": {
+            "texture_size": DEFAULT_TEXTURE_SIZE,
+            "vertex_count": DEFAULT_VERTEX_COUNT,
+        },
+        "auth_required": bool(EXPECTED_BEARER_TOKEN),
+        "cache": {
+            "enabled": CACHE_ENABLED,
+            "directory": str(CACHE_DIR),
+            "entries": len(list(CACHE_DIR.glob("*.glb"))) if CACHE_ENABLED else 0,
+        },
+        "gpu": get_gpu_info(),
+        "metrics": metrics,
+    }
 
 
 @app.post("/generate")
 async def generate_3d_model(
+    request: Request,
     image: UploadFile = File(..., description="Input image file (PNG, JPG, JPEG)"),
     foreground_ratio: float = Query(
         0.85, ge=0.5, le=1.0, description="Foreground ratio (0.5-1.0)"
     ),
     texture_size: int = Query(
-        None, ge=256, le=2048, description="Texture resolution (256-2048), default based on runtime profile"
+        None,
+        ge=256,
+        le=2048,
+        description="Texture resolution, default chosen from runtime profile",
     ),
     remesh_option: str = Query(
         "none",
@@ -285,129 +560,94 @@ async def generate_3d_model(
         None, ge=-1, le=50000, description="Target vertex count (-1 for no limit)"
     ),
 ):
-    """
-    Generate a 3D GLB model from an uploaded image.
+    require_bearer_token(request)
+    metrics["generate_requests_total"] += 1
 
-    - **image**: Input image file (PNG, JPG, JPEG)
-    - **foreground_ratio**: How much of the image should be foreground (0.5-1.0)
-    - **texture_size**: Resolution of the output texture (256-2048)
-    - **remesh_option**: Mesh topology option (none/triangle/quad)
-    - **vertex_count**: Target vertex count (-1 for automatic)
-
-    Returns: GLB file containing the 3D model
-    """
-    # Apply runtime-profile defaults if not specified
-    if texture_size is None:
-        texture_size = DEFAULT_TEXTURE_SIZE
-    if vertex_count is None:
-        vertex_count = DEFAULT_VERTEX_COUNT
-    # Validate file type
-    if not image.content_type or not image.content_type.startswith("image/"):
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid file type. Please upload an image (PNG, JPG, JPEG)",
-        )
+    normalized_texture_size, normalized_vertex_count = normalize_generation_settings(
+        texture_size, vertex_count
+    )
 
     try:
-        # Read and process image
-        contents = await image.read()
-        pil_image = Image.open(io.BytesIO(contents))
-
-        # Process image (remove background, resize)
-        processed_image = process_image(pil_image, foreground_ratio)
-
-        # Generate 3D mesh
-        glb_path = generate_mesh(
-            processed_image,
-            texture_size=texture_size,
+        image_bytes = await validate_upload(image)
+        glb_bytes, request_hash, cached, duration_seconds = await get_glb_bytes(
+            image_bytes=image_bytes,
+            foreground_ratio=foreground_ratio,
+            texture_size=normalized_texture_size,
             remesh_option=remesh_option,
-            vertex_count=vertex_count,
+            vertex_count=normalized_vertex_count,
         )
 
-        # Return the GLB file
-        return FileResponse(
-            glb_path,
+        metrics["last_error"] = None
+        metrics["successful_generations"] += 1
+        return Response(
+            content=glb_bytes,
             media_type="model/gltf-binary",
-            filename="model.glb",
-            headers={
-                "Content-Disposition": "attachment; filename=model.glb",
-                "Access-Control-Expose-Headers": "Content-Disposition",
-            },
+            headers=build_response_headers(cached, request_hash, duration_seconds),
         )
-
-    except Exception as e:
-        print(f"Error generating model: {e}")
-        raise HTTPException(status_code=500, detail=f"Error generating model: {str(e)}")
+    except HTTPException:
+        metrics["failed_generations"] += 1
+        raise
+    except Exception as exc:
+        metrics["failed_generations"] += 1
+        metrics["last_error"] = str(exc)
+        print(f"Error generating model: {exc}")
+        raise HTTPException(status_code=500, detail=f"Error generating model: {exc}") from exc
 
 
 @app.post("/generate/base64")
 async def generate_3d_model_base64(
+    request: Request,
     image: UploadFile = File(..., description="Input image file (PNG, JPG, JPEG)"),
     foreground_ratio: float = Query(0.85, ge=0.5, le=1.0),
     texture_size: int = Query(None, ge=256, le=2048),
     remesh_option: str = Query("none", pattern="^(none|triangle|quad)$"),
     vertex_count: int = Query(None, ge=-1, le=50000),
 ):
-    """
-    Generate a 3D GLB model and return it as base64 encoded string.
-    Useful for Unity when you need the data directly instead of a file download.
-    """
-    import base64
+    require_bearer_token(request)
+    metrics["generate_requests_total"] += 1
 
-    # Apply runtime-profile defaults if not specified
-    if texture_size is None:
-        texture_size = DEFAULT_TEXTURE_SIZE
-    if vertex_count is None:
-        vertex_count = DEFAULT_VERTEX_COUNT
-
-    # Validate file type
-    if not image.content_type or not image.content_type.startswith("image/"):
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid file type. Please upload an image (PNG, JPG, JPEG)",
-        )
+    normalized_texture_size, normalized_vertex_count = normalize_generation_settings(
+        texture_size, vertex_count
+    )
 
     try:
-        # Read and process image
-        contents = await image.read()
-        pil_image = Image.open(io.BytesIO(contents))
-
-        # Process image (remove background, resize)
-        processed_image = process_image(pil_image, foreground_ratio)
-
-        # Generate 3D mesh
-        glb_path = generate_mesh(
-            processed_image,
-            texture_size=texture_size,
+        image_bytes = await validate_upload(image)
+        glb_bytes, request_hash, cached, duration_seconds = await get_glb_bytes(
+            image_bytes=image_bytes,
+            foreground_ratio=foreground_ratio,
+            texture_size=normalized_texture_size,
             remesh_option=remesh_option,
-            vertex_count=vertex_count,
+            vertex_count=normalized_vertex_count,
         )
 
-        # Read the GLB file and encode as base64
-        with open(glb_path, "rb") as f:
-            glb_bytes = f.read()
-
-        glb_base64 = base64.b64encode(glb_bytes).decode("utf-8")
-
+        metrics["last_error"] = None
+        metrics["successful_generations"] += 1
         return {
             "success": True,
-            "model_base64": glb_base64,
+            "cached": cached,
+            "request_hash": request_hash,
+            "duration_seconds": round(duration_seconds, 3),
             "format": "glb",
+            "model_base64": base64.b64encode(glb_bytes).decode("utf-8"),
         }
-
-    except Exception as e:
-        print(f"Error generating model: {e}")
-        raise HTTPException(status_code=500, detail=f"Error generating model: {str(e)}")
+    except HTTPException:
+        metrics["failed_generations"] += 1
+        raise
+    except Exception as exc:
+        metrics["failed_generations"] += 1
+        metrics["last_error"] = str(exc)
+        print(f"Error generating model: {exc}")
+        raise HTTPException(status_code=500, detail=f"Error generating model: {exc}") from exc
 
 
 if __name__ == "__main__":
     import uvicorn
 
-    print("Starting Stable Fast 3D API server...")
-    print("Binding to 0.0.0.0:8000 (accessible from LAN)")
+    print("Starting Scan Space Stable Fast 3D API server...")
+    print(f"Binding to {HOST}:{PORT}")
     uvicorn.run(
         app,
-        host="0.0.0.0",
-        port=8000,
-        timeout_keep_alive=120,  # Keep connections alive for slower networks
+        host=HOST,
+        port=PORT,
+        timeout_keep_alive=120,
     )
