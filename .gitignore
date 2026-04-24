@@ -1,0 +1,93 @@
+# Unity generated folders
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Bb]uild/
+[Bb]uilds/
+[Ll]ogs/
+[Uu]ser[Ss]ettings/
+[Mm]emoryCaptures/
+[Rr]ecordings/
+
+# Visual Studio / Rider / IDE
+.vs/
+.vscode/
+.idea/
+.consulo/
+ExportedObj/
+*.csproj
+*.unityproj
+*.sln
+*.slnx
+*.suo
+*.tmp
+*.user
+*.userprefs
+*.pidb
+*.booproj
+*.svd
+*.pdb
+*.mdb
+*.opendb
+*.VC.db
+*.DotSettings.user
+
+# Unity auto-generated metadata for ignored files
+*.pidb.meta
+*.pdb.meta
+*.mdb.meta
+
+# Crash reports
+sysinfo.txt
+mono_crash.*
+*.stacktrace
+
+# Packages / builds
+*.apk
+*.aab
+*.app
+*.unitypackage
+*.unitypackage.meta
+
+# Addressables / test runner / generated dbs
+ServerData/
+[Aa]ssets/StreamingAssets/aa*
+[Aa]ssets/AddressableAssetsData/link.xml*
+[Aa]ssets/Addressables_Temp*
+[Aa]ssets/AddressableAssetsData/*/*.bin*
+InitTestScene*.unity*
+[Aa]ssets/[Ii]nit[Tt]est[Ss]cene*.unity*
+[Aa]ssets/Unity.VisualScripting.Generated/VisualScripting.Flow/UnitOptions.db
+[Aa]ssets/Unity.VisualScripting.Generated/VisualScripting.Flow/UnitOptions.db.meta
+[Aa]ssets/Unity.VisualScripting.Generated/VisualScripting.Core/Property Providers
+[Aa]ssets/Unity.VisualScripting.Generated/VisualScripting.Core/Property Providers.meta
+
+# JetBrains generated Unity plugin
+[Aa]ssets/Plugins/Editor/JetBrains*
+
+# TextMeshPro generated font materials
+[Aa]ssets/[Tt]ext[Mm]esh*[Pp]ro/[Rr]esources/[Ff]onts & [Mm]aterials/*.asset
+
+# Python environments and caches for local backend work
+.venv/
+.venv312/
+venv/
+venv311/
+__pycache__/
+*.pyc
+*.pyo
+
+# Local backend outputs
+stable-fast-3d/output/
+stable-fast-3d/load/
+stable-fast-3d/model.glb
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Keep Unity meta files unless the asset itself is ignored
+!/[Aa]ssets/**/*.meta
