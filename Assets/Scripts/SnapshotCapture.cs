@@ -22,6 +22,9 @@ public class SnapshotCapture : MonoBehaviour
     [SerializeField] private KeyCode editorTestKey = KeyCode.C;
     [SerializeField] private KeyCode editorSubmitKey = KeyCode.X;
 
+    [Header("Upload Settings")]
+    [SerializeField] private int uploadMaxDimension = 1024;
+
     [Header("Preview Placement")]
     [SerializeField] private LayerMask placementMask = ~0;
     [SerializeField] private float previewFallbackDistance = 0.9f;
@@ -115,8 +118,11 @@ public class SnapshotCapture : MonoBehaviour
             if (saveCaptureToDisk)
                 LastCapturePath = SaveTextureToDisk(texture);
 
-            if (autoUploadAfterCapture)
+            bool shouldSubmitImmediately = apiClient != null && (autoUploadAfterCapture || Application.isPlaying);
+
+            if (shouldSubmitImmediately)
             {
+                UpdatePreviewState("Preview ready. Sending to the server...");
                 SubmitPendingCapture();
             }
             else
@@ -166,7 +172,8 @@ public class SnapshotCapture : MonoBehaviour
             return;
         }
 
-        Texture2D sendTexture = CloneTexture(_pendingCapture);
+        Debug.Log("[SnapshotCapture] Sending pending capture to APIClient.");
+        Texture2D sendTexture = CloneTexture(_pendingCapture, uploadMaxDimension);
         if (sendTexture == null)
         {
             UpdatePreviewState("Could not prepare preview for sending.");
@@ -236,7 +243,7 @@ public class SnapshotCapture : MonoBehaviour
         _submitting = false;
         UpdatePreviewState(
             success
-                ? "Model generation started. Press A to capture another image."
+                ? "Model received. Press A to capture another image."
                 : "Send failed. Press X to retry or A to recapture."
         );
     }
@@ -348,14 +355,33 @@ public class SnapshotCapture : MonoBehaviour
             previewStatusText.text = $"{message}\nA = Capture preview   X = Send to server";
     }
 
-    private static Texture2D CloneTexture(Texture2D source)
+    private static Texture2D CloneTexture(Texture2D source, int maxDimension)
     {
         if (source == null)
             return null;
 
-        var clone = new Texture2D(source.width, source.height, source.format, false);
-        clone.SetPixels(source.GetPixels());
+        int targetWidth = source.width;
+        int targetHeight = source.height;
+
+        if (maxDimension > 0 && (source.width > maxDimension || source.height > maxDimension))
+        {
+            float scale = Mathf.Min((float)maxDimension / source.width, (float)maxDimension / source.height);
+            targetWidth = Mathf.Max(1, Mathf.RoundToInt(source.width * scale));
+            targetHeight = Mathf.Max(1, Mathf.RoundToInt(source.height * scale));
+        }
+
+        RenderTexture rt = RenderTexture.GetTemporary(targetWidth, targetHeight, 0, RenderTextureFormat.ARGB32);
+        Graphics.Blit(source, rt);
+
+        RenderTexture prev = RenderTexture.active;
+        RenderTexture.active = rt;
+
+        var clone = new Texture2D(targetWidth, targetHeight, TextureFormat.RGBA32, false);
+        clone.ReadPixels(new Rect(0, 0, targetWidth, targetHeight), 0, 0);
         clone.Apply();
+
+        RenderTexture.active = prev;
+        RenderTexture.ReleaseTemporary(rt);
         return clone;
     }
 

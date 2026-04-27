@@ -64,6 +64,7 @@ public class APIClient : MonoBehaviour
 
         SetStatus("Checking backend...");
 
+        bool healthOk = false;
         using (var healthRequest = UnityWebRequest.Get(config.HealthURL))
         {
             healthRequest.timeout = 10;
@@ -71,20 +72,19 @@ public class APIClient : MonoBehaviour
             Debug.Log($"[APIClient] Health check -> {config.HealthURL}");
             yield return healthRequest.SendWebRequest();
 
-            if (healthRequest.result != UnityWebRequest.Result.Success)
+            if (healthRequest.result == UnityWebRequest.Result.Success)
+            {
+                healthOk = true;
+            }
+            else
             {
                 string healthError = BuildRequestError("Backend health check failed", healthRequest);
-                healthError += " | Verify the PC server is running, the LAN IP is correct, and Android cleartext HTTP is allowed.";
-
-                SetStatus(healthError);
-                Debug.LogError($"[APIClient] {healthError}");
-                CompleteRequest(false, onCompleted);
-                yield break;
+                Debug.LogWarning($"[APIClient] {healthError}");
+                SetStatus("Health check failed. Trying generation anyway...");
             }
         }
 
-        // Stable Fast 3D's FastAPI server returns the GLB directly from /generate.
-        SetStatus("Sending image to SF3D server...");
+        SetStatus(healthOk ? "Sending image to SF3D server..." : "Sending image to SF3D server without preflight...");
 
         var form = new WWWForm();
         form.AddBinaryData("image", jpgBytes, "snapshot.jpg", "image/jpeg");
@@ -100,6 +100,7 @@ public class APIClient : MonoBehaviour
             if (generateRequest.result != UnityWebRequest.Result.Success)
             {
                 string errorMsg = BuildRequestError("Generate failed", generateRequest);
+                errorMsg += $" | Base URL: {config.baseUrl}";
                 SetStatus(errorMsg);
                 Debug.LogError($"[APIClient] Generate failed - {errorMsg}");
                 CompleteRequest(false, onCompleted);
