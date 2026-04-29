@@ -1,3 +1,4 @@
+import os
 from dataclasses import dataclass
 from typing import Optional
 
@@ -23,7 +24,16 @@ class DINOV2SingleImageTokenizer(BaseModule):
     cfg: Config
 
     def configure(self) -> None:
-        self.model = Dinov2Model.from_pretrained(self.cfg.pretrained_model_name_or_path)
+        local_files_only = os.getenv("SCANSPACE_HF_LOCAL_ONLY", "1").strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+        self.model = Dinov2Model.from_pretrained(
+            self.cfg.pretrained_model_name_or_path,
+            local_files_only=local_files_only,
+        )
 
         for p in self.model.parameters():
             p.requires_grad_(False)

@@ -1,4 +1,5 @@
 using System.IO;
+using System.Collections;
 using Meta.XR;
 using TMPro;
 using UnityEngine;
@@ -8,38 +9,84 @@ public class SnapshotCapture : MonoBehaviour
 {
     [Header("References")]
     [SerializeField] private APIClient apiClient;
+    [SerializeField] private ModelLoader modelLoader;
     [SerializeField] private PassthroughCameraAccess passthroughCamera;
     [SerializeField] private Transform centerEyeAnchor;
     [SerializeField] private Canvas previewCanvas;
     [SerializeField] private RectTransform previewPanel;
     [SerializeField] private RawImage previewImage;
     [SerializeField] private TMP_Text previewStatusText;
+    [SerializeField] private TMP_Text appTitleText;
+    [SerializeField] private Transform rightControllerAnchor;
+    [SerializeField] private RectTransform cropFrame;
 
     [Header("Capture Flow")]
     [SerializeField] private bool autoUploadAfterCapture = false;
     [SerializeField] private bool saveCaptureToDisk = true;
     [SerializeField] private string captureFolderName = "QuestCaptures";
+    [SerializeField] private float captureDelaySeconds = 2f;
     [SerializeField] private KeyCode editorTestKey = KeyCode.C;
-    [SerializeField] private KeyCode editorSubmitKey = KeyCode.X;
+    [SerializeField] private KeyCode editorSaveModelKey = KeyCode.X;
+    [SerializeField] private KeyCode editorPlaceModelKey = KeyCode.B;
+    [SerializeField] private KeyCode editorRemoveModelKey = KeyCode.Y;
 
     [Header("Upload Settings")]
-    [SerializeField] private int uploadMaxDimension = 1024;
+    [SerializeField] private int uploadMaxDimension = 1280;
+    [SerializeField] private bool flipCapturedImageVertically = false;
+    [SerializeField] private bool useCropBoundary = true;
+    [SerializeField] private Vector2 defaultCropCenter = new(0.5f, 0.5f);
+    [SerializeField] private Vector2 defaultCropSize = new(0.72f, 0.72f);
+    [SerializeField] private float minCropSize = 0.18f;
+    [SerializeField] private float cropMoveSpeed = 0.55f;
+    [SerializeField] private float cropResizeSpeed = 0.65f;
+    [SerializeField] private bool verboseDebugLogging = true;
 
     [Header("Preview Placement")]
     [SerializeField] private LayerMask placementMask = ~0;
     [SerializeField] private float previewFallbackDistance = 0.9f;
     [SerializeField] private float previewSurfaceOffset = 0.08f;
-    [SerializeField] private Vector2 previewPanelSize = new(0.32f, 0.24f);
+    [SerializeField] private Vector2 previewPanelSize = new(0.58f, 0.4f);
+    [SerializeField] private bool flipPreviewImageVertically = false;
+
+    [Header("UI Layout")]
+    [SerializeField] private string appTitle = "ScanSpace";
+    [SerializeField] private float titleFontSize = 34f;
+    [SerializeField] private float statusFontSize = 20f;
+    [SerializeField] private Vector2 titleOffsetMin = new(18f, -56f);
+    [SerializeField] private Vector2 titleOffsetMax = new(-18f, -8f);
+    [SerializeField] private Vector2 previewImageSize = new(520f, 292f);
+    [SerializeField] private Vector2 previewImageAnchoredPosition = new(0f, -62f);
+    [SerializeField] private Vector2 statusOffsetMin = new(18f, 14f);
+    [SerializeField] private Vector2 statusOffsetMax = new(-18f, 0f);
+    [SerializeField] private float statusHeight = 72f;
+    [SerializeField] private Color cropBorderColor = new(0.05f, 0.9f, 1f, 0.95f);
+
+    [Header("Model Controls")]
+    [SerializeField] private float stickDeadzone = 0.18f;
+    [SerializeField] private float modelMoveSpeed = 0.65f;
+    [SerializeField] private float modelRotateSpeed = 90f;
+    [SerializeField] private float modelScaleSpeed = 0.9f;
+    [SerializeField] private float modelDragTriggerThreshold = 0.1f;
+    [SerializeField] private float modelDragFallbackDistance = 1.1f;
+    [SerializeField] private float modelDragDistanceSpeed = 1.25f;
 
     private bool _capturing;
     private bool _submitting;
     private Texture2D _pendingCapture;
+    private Coroutine _captureDelayCoroutine;
+    private readonly Image[] _cropBorders = new Image[4];
+    private Vector2 _cropCenter;
+    private Vector2 _cropSize;
+    private bool _hasGeneratedModelForPendingCapture;
+    private bool _isDraggingModel;
+    private float _modelDragDistance;
 
     public string LastCapturePath { get; private set; }
 
     private void Awake()
     {
         ResolveReferences();
+        ResetCropBoundary();
         EnsurePreviewUI();
         UpdatePreviewState("Press A to capture an image.");
     }
@@ -60,31 +107,109 @@ public class SnapshotCapture : MonoBehaviour
 
     private void Update()
     {
-        if (!_capturing)
+        bool editorCapturePressed = false;
+        bool editorSavePressed = false;
+        bool editorPlacePressed = false;
+        bool editorRemovePressed = false;
+
+#if UNITY_EDITOR || ENABLE_LEGACY_INPUT_MANAGER
+        editorCapturePressed = Input.GetKeyDown(editorTestKey);
+        editorSavePressed = Input.GetKeyDown(editorSaveModelKey);
+        editorPlacePressed = Input.GetKeyDown(editorPlaceModelKey);
+        editorRemovePressed = Input.GetKeyDown(editorRemoveModelKey);
+#endif
+
+        bool requestRunning = _submitting || (apiClient != null && apiClient.IsSending);
+        bool cropSelectionActive = IsCropSelectionActive(requestRunning);
+
+        if (!_capturing && !requestRunning)
         {
             bool capturePressed =
                 OVRInput.GetDown(OVRInput.Button.One, OVRInput.Controller.RTouch) ||
-                Input.GetKeyDown(editorTestKey);
+                editorCapturePressed;
 
             if (capturePressed)
             {
-                CaptureSnapshot();
+                RequestCapture();
             }
         }
 
-        bool submitPressed =
-            OVRInput.GetDown(OVRInput.Button.Three, OVRInput.Controller.LTouch) ||
-            Input.GetKeyDown(editorSubmitKey);
+        bool savePressed =
+            GetButtonDown(OVRInput.Button.Three, OVRInput.RawButton.X, OVRInput.Controller.LTouch) ||
+            editorSavePressed;
 
-        if (submitPressed)
+        if (savePressed)
         {
-            SubmitPendingCapture();
+            SaveCurrentModel();
         }
+
+        bool generateOrPlacePressed =
+            GetButtonDown(OVRInput.Button.Two, OVRInput.RawButton.B, OVRInput.Controller.RTouch) ||
+            editorPlacePressed;
+
+        if (generateOrPlacePressed)
+        {
+            if (cropSelectionActive)
+                SubmitPendingCapture();
+            else
+                PlaceCurrentModelAtPreview();
+        }
+
+        bool removePressed =
+            GetButtonDown(OVRInput.Button.Four, OVRInput.RawButton.Y, OVRInput.Controller.LTouch) ||
+            editorRemovePressed;
+
+        if (removePressed)
+        {
+            RemoveOrCancel();
+        }
+
+        UpdateCropBoxControls(requestRunning);
+        UpdateModelDragControls();
+        UpdateModelStickControls();
+    }
+
+    private void RequestCapture()
+    {
+        if (captureDelaySeconds <= 0f)
+        {
+            CaptureSnapshot();
+            return;
+        }
+
+        if (_captureDelayCoroutine != null)
+        {
+            UpdatePreviewState("Capture countdown already running...");
+            return;
+        }
+
+        _captureDelayCoroutine = StartCoroutine(CaptureAfterDelay());
+    }
+
+    private IEnumerator CaptureAfterDelay()
+    {
+        float remaining = captureDelaySeconds;
+        while (remaining > 0f)
+        {
+            UpdatePreviewState($"Move hands away. Capturing in {Mathf.CeilToInt(remaining)}...");
+            yield return new WaitForSeconds(0.25f);
+            remaining -= 0.25f;
+        }
+
+        _captureDelayCoroutine = null;
+        CaptureSnapshot();
     }
 
     private void CaptureSnapshot()
     {
         ResolveReferences();
+
+        if (_submitting || (apiClient != null && apiClient.IsSending))
+        {
+            LogDebug("Capture ignored because a send is already running.");
+            UpdatePreviewState("Generating model. Please wait...");
+            return;
+        }
 
         if (passthroughCamera == null)
         {
@@ -113,12 +238,17 @@ public class SnapshotCapture : MonoBehaviour
             if (texture == null)
                 return;
 
+            LogDebug($"Capture ready | {texture.width}x{texture.height} fmt={texture.format}");
+
             SetPendingCapture(texture);
 
             if (saveCaptureToDisk)
                 LastCapturePath = SaveTextureToDisk(texture);
 
-            bool shouldSubmitImmediately = apiClient != null && (autoUploadAfterCapture || Application.isPlaying);
+            bool shouldSubmitImmediately = apiClient != null && autoUploadAfterCapture;
+            LogDebug(
+                $"Capture flow | autoUpload={autoUploadAfterCapture} playing={Application.isPlaying} apiClient={(apiClient != null)} submit={shouldSubmitImmediately}"
+            );
 
             if (shouldSubmitImmediately)
             {
@@ -127,13 +257,14 @@ public class SnapshotCapture : MonoBehaviour
             }
             else
             {
-                UpdatePreviewState("Preview ready. Press X to send to the server.");
+                UpdatePreviewState("Preview ready. Adjust boundary, then press B.");
                 Debug.Log("[SnapshotCapture] Capture stored locally and shown in preview.");
             }
         }
         catch (System.Exception e)
         {
             Debug.LogError($"[SnapshotCapture] Capture failed: {e.Message}");
+            LogDebug($"Capture failed | {e.Message}");
             UpdatePreviewState($"Capture failed: {e.Message}");
         }
         finally
@@ -146,10 +277,11 @@ public class SnapshotCapture : MonoBehaviour
     {
         ResolveReferences();
         EnsurePreviewUI();
+        LogDebug($"Submit requested | pending={_pendingCapture != null} submitting={_submitting} apiClient={(apiClient != null)} apiSending={(apiClient != null && apiClient.IsSending)}");
 
         if (_submitting)
         {
-            UpdatePreviewState("Send already in progress...");
+            UpdatePreviewState("Generating model. Please wait...");
             return;
         }
 
@@ -168,20 +300,22 @@ public class SnapshotCapture : MonoBehaviour
 
         if (apiClient.IsSending)
         {
-            UpdatePreviewState("Backend request already running...");
+            UpdatePreviewState("Generating model. Please wait...");
             return;
         }
 
         Debug.Log("[SnapshotCapture] Sending pending capture to APIClient.");
-        Texture2D sendTexture = CloneTexture(_pendingCapture, uploadMaxDimension);
+        Texture2D sendTexture = CreateUploadTexture(_pendingCapture);
         if (sendTexture == null)
         {
             UpdatePreviewState("Could not prepare preview for sending.");
             return;
         }
 
+        LogDebug($"Prepared upload texture | {sendTexture.width}x{sendTexture.height} fmt={sendTexture.format}");
+
         _submitting = true;
-        UpdatePreviewState("Sending preview to the server...");
+        UpdatePreviewState($"Sending preview to the server ({sendTexture.width}x{sendTexture.height})...");
         apiClient.SendImage(sendTexture, HandleSubmitCompleted);
     }
 
@@ -190,11 +324,17 @@ public class SnapshotCapture : MonoBehaviour
         if (apiClient == null)
             apiClient = FindFirstObjectByType<APIClient>();
 
+        if (modelLoader == null)
+            modelLoader = FindFirstObjectByType<ModelLoader>();
+
         if (passthroughCamera == null)
             passthroughCamera = FindFirstObjectByType<PassthroughCameraAccess>();
 
         if (centerEyeAnchor == null)
             centerEyeAnchor = Camera.main != null ? Camera.main.transform : centerEyeAnchor;
+
+        if (rightControllerAnchor == null)
+            rightControllerAnchor = FindNamedTransform("RightControllerAnchor") ?? FindNamedTransform("RightHandAnchor");
     }
 
     private Texture2D CaptureTexture()
@@ -207,6 +347,8 @@ public class SnapshotCapture : MonoBehaviour
             return null;
         }
 
+        LogDebug($"Source texture | {srcTexture.width}x{srcTexture.height} type={srcTexture.GetType().Name}");
+
         RenderTexture rt = RenderTexture.GetTemporary(srcTexture.width, srcTexture.height, 0, RenderTextureFormat.ARGB32);
         Graphics.Blit(srcTexture, rt);
 
@@ -215,6 +357,13 @@ public class SnapshotCapture : MonoBehaviour
 
         var texture = new Texture2D(rt.width, rt.height, TextureFormat.RGBA32, false);
         texture.ReadPixels(new Rect(0, 0, rt.width, rt.height), 0, 0);
+
+        if (flipCapturedImageVertically)
+        {
+            FlipTextureVerticalInPlace(texture);
+            LogDebug("Applied vertical flip to captured camera image.");
+        }
+
         texture.Apply();
 
         RenderTexture.active = prev;
@@ -228,28 +377,37 @@ public class SnapshotCapture : MonoBehaviour
             Destroy(_pendingCapture);
 
         _pendingCapture = texture;
+        _hasGeneratedModelForPendingCapture = false;
+        ResetCropBoundary();
         EnsurePreviewUI();
+        SetPreviewVisible(true);
         PositionPreviewPanel();
 
         if (previewImage != null)
         {
             previewImage.texture = _pendingCapture;
             previewImage.enabled = true;
+            ApplyPreviewImageOrientation();
+            UpdateCropFrame();
         }
     }
 
     private void HandleSubmitCompleted(bool success)
     {
         _submitting = false;
+        _hasGeneratedModelForPendingCapture = success;
+        LogDebug($"Submit completed | success={success}");
+        UpdateCropFrame();
         UpdatePreviewState(
             success
-                ? "Model received. Press A to capture another image."
-                : "Send failed. Press X to retry or A to recapture."
+                ? "Model ready. Hold trigger to drag. Left stick resizes."
+                : "Send failed. Press A to recapture."
         );
     }
 
     private void HandleApiStatusChanged(string message)
     {
+        LogDebug($"API status | {message}");
         if (_submitting || (apiClient != null && apiClient.IsSending))
             UpdatePreviewState(message);
     }
@@ -293,14 +451,14 @@ public class SnapshotCapture : MonoBehaviour
             previewImage = imageObject.GetComponent<RawImage>();
             previewImage.color = Color.white;
             previewImage.enabled = _pendingCapture != null;
+            ApplyPreviewImageOrientation();
 
             RectTransform imageRect = imageObject.GetComponent<RectTransform>();
-            imageRect.anchorMin = new Vector2(0.5f, 1f);
-            imageRect.anchorMax = new Vector2(0.5f, 1f);
-            imageRect.pivot = new Vector2(0.5f, 1f);
-            imageRect.sizeDelta = new Vector2(380f, 214f);
-            imageRect.anchoredPosition = new Vector2(0f, -20f);
         }
+
+        ApplyPreviewImageLayout();
+        EnsureCropFrame();
+        EnsureInstructionTitle();
 
         if (previewStatusText == null)
         {
@@ -308,21 +466,25 @@ public class SnapshotCapture : MonoBehaviour
             textObject.transform.SetParent(previewPanel.transform, false);
 
             previewStatusText = textObject.GetComponent<TMP_Text>();
-            previewStatusText.fontSize = 22;
-            previewStatusText.alignment = TextAlignmentOptions.TopLeft;
             previewStatusText.color = Color.white;
+            previewStatusText.enableWordWrapping = true;
+            previewStatusText.overflowMode = TextOverflowModes.Ellipsis;
+        }
 
-            RectTransform textRect = textObject.GetComponent<RectTransform>();
-            textRect.anchorMin = new Vector2(0f, 0f);
-            textRect.anchorMax = new Vector2(1f, 0f);
-            textRect.pivot = new Vector2(0.5f, 0f);
-            textRect.offsetMin = new Vector2(20f, 20f);
-            textRect.offsetMax = new Vector2(-20f, 0f);
-            textRect.sizeDelta = new Vector2(0f, 72f);
+        ApplyStatusTextLayout();
+
+        if (appTitleText != null)
+        {
+            appTitleText.text = appTitle;
+            appTitleText.fontSize = titleFontSize;
         }
 
         if (_pendingCapture != null && previewImage != null)
+        {
             previewImage.texture = _pendingCapture;
+            ApplyPreviewImageOrientation();
+            UpdateCropFrame();
+        }
     }
 
     private void PositionPreviewPanel()
@@ -342,9 +504,9 @@ public class SnapshotCapture : MonoBehaviour
         previewCanvas.renderMode = RenderMode.WorldSpace;
         previewCanvas.transform.position = targetPosition;
 
-        Vector3 lookDirection = centerEyeAnchor.position - previewCanvas.transform.position;
-        if (lookDirection.sqrMagnitude > 0.0001f)
-            previewCanvas.transform.rotation = Quaternion.LookRotation(lookDirection.normalized);
+        Vector3 fromHeadToPreview = previewCanvas.transform.position - centerEyeAnchor.position;
+        if (fromHeadToPreview.sqrMagnitude > 0.0001f)
+            previewCanvas.transform.rotation = Quaternion.LookRotation(fromHeadToPreview.normalized, Vector3.up);
     }
 
     private void UpdatePreviewState(string message)
@@ -352,7 +514,431 @@ public class SnapshotCapture : MonoBehaviour
         EnsurePreviewUI();
 
         if (previewStatusText != null)
-            previewStatusText.text = $"{message}\nA = Capture preview   X = Send to server";
+            previewStatusText.text = $"{message}\n{BuildControlHint()}";
+    }
+
+    private void PlaceCurrentModelAtPreview()
+    {
+        ResolveReferences();
+        EnsurePreviewUI();
+
+        if (modelLoader == null)
+        {
+            UpdatePreviewState("Model loader missing. Cannot place model.");
+            Debug.LogError("[SnapshotCapture] ModelLoader reference is not assigned.");
+            return;
+        }
+
+        if (!modelLoader.HasCurrentModel)
+        {
+            UpdatePreviewState("No generated model yet. Capture first.");
+            return;
+        }
+
+        PositionPreviewPanel();
+
+        if (previewCanvas == null)
+        {
+            UpdatePreviewState("Preview position missing. Cannot place model.");
+            return;
+        }
+
+        if (modelLoader.MoveCurrentModelToPreview(previewCanvas.transform))
+        {
+            SetPreviewVisible(false);
+            Debug.Log("[SnapshotCapture] Model placed at preview image pose.");
+        }
+        else
+        {
+            UpdatePreviewState("Could not place generated model.");
+        }
+    }
+
+    private void RemoveCurrentModel()
+    {
+        ResolveReferences();
+
+        if (modelLoader == null)
+        {
+            UpdatePreviewState("Model loader missing. Cannot remove model.");
+            Debug.LogError("[SnapshotCapture] ModelLoader reference is not assigned.");
+            return;
+        }
+
+        SetPreviewVisible(true);
+        UpdatePreviewState(
+            modelLoader.RemoveCurrentModel()
+                ? "Model removed. Press A to capture again."
+                : "No generated model to remove."
+        );
+    }
+
+    private void RemoveOrCancel()
+    {
+        if (modelLoader != null && modelLoader.HasCurrentModel)
+        {
+            RemoveCurrentModel();
+            return;
+        }
+
+        if (_pendingCapture != null)
+        {
+            Destroy(_pendingCapture);
+            _pendingCapture = null;
+            _hasGeneratedModelForPendingCapture = false;
+            SetCropFrameVisible(false);
+            UpdatePreviewState("Preview cleared. Press A to capture.");
+            return;
+        }
+
+        RemoveCurrentModel();
+    }
+
+    private void SaveCurrentModel()
+    {
+        ResolveReferences();
+
+        if (apiClient == null)
+        {
+            UpdatePreviewState("API client missing. Cannot save model.");
+            Debug.LogError("[SnapshotCapture] APIClient reference is not assigned.");
+            return;
+        }
+
+        bool saved = apiClient.SaveLatestGeneratedModelToDisk();
+        UpdatePreviewState(
+            saved
+                ? "Model saved on device."
+                : "No generated model to save yet."
+        );
+    }
+
+    private void UpdateModelStickControls()
+    {
+        if (IsCropSelectionActive(false) || _isDraggingModel)
+            return;
+
+        if (modelLoader == null || !modelLoader.HasCurrentModel || (apiClient != null && apiClient.IsSending))
+            return;
+
+        Vector2 moveAxis = OVRInput.Get(OVRInput.RawAxis2D.RThumbstick);
+        Vector2 adjustAxis = OVRInput.Get(OVRInput.RawAxis2D.LThumbstick);
+
+        if (moveAxis.sqrMagnitude > stickDeadzone * stickDeadzone)
+        {
+            Transform basis = centerEyeAnchor != null ? centerEyeAnchor : transform;
+            Vector3 forward = Vector3.ProjectOnPlane(basis.forward, Vector3.up).normalized;
+            Vector3 right = Vector3.ProjectOnPlane(basis.right, Vector3.up).normalized;
+            Vector3 delta = (right * moveAxis.x + forward * moveAxis.y) * (modelMoveSpeed * Time.deltaTime);
+            modelLoader.NudgeCurrentModel(delta);
+        }
+
+        if (Mathf.Abs(adjustAxis.x) > stickDeadzone)
+            modelLoader.RotateCurrentModel(adjustAxis.x * modelRotateSpeed * Time.deltaTime);
+
+        if (Mathf.Abs(adjustAxis.y) > stickDeadzone)
+        {
+            float multiplier = 1f + adjustAxis.y * modelScaleSpeed * Time.deltaTime;
+            modelLoader.ScaleCurrentModel(Mathf.Max(0.01f, multiplier));
+        }
+    }
+
+    private void UpdateCropBoxControls(bool requestRunning)
+    {
+        if (!IsCropSelectionActive(requestRunning))
+        {
+            UpdateCropFrame();
+            return;
+        }
+
+        bool changed = false;
+        Vector2 moveAxis = OVRInput.Get(OVRInput.RawAxis2D.RThumbstick);
+        Vector2 resizeAxis = OVRInput.Get(OVRInput.RawAxis2D.LThumbstick);
+
+        if (moveAxis.sqrMagnitude > stickDeadzone * stickDeadzone)
+        {
+            _cropCenter += moveAxis * (cropMoveSpeed * Time.deltaTime);
+            changed = true;
+        }
+
+        if (Mathf.Abs(resizeAxis.x) > stickDeadzone || Mathf.Abs(resizeAxis.y) > stickDeadzone)
+        {
+            _cropSize += resizeAxis * (cropResizeSpeed * Time.deltaTime);
+            changed = true;
+        }
+
+        if (changed)
+        {
+            ClampCropBoundary();
+            UpdateCropFrame();
+        }
+    }
+
+    private void UpdateModelDragControls()
+    {
+        if (IsCropSelectionActive(false) || modelLoader == null || !modelLoader.HasCurrentModel)
+        {
+            _isDraggingModel = false;
+            return;
+        }
+
+        bool triggerHeld = OVRInput.Get(OVRInput.RawAxis1D.RIndexTrigger) >= modelDragTriggerThreshold
+                           || OVRInput.Get(OVRInput.Button.PrimaryIndexTrigger, OVRInput.Controller.RTouch)
+                           || OVRInput.Get(OVRInput.RawButton.RIndexTrigger);
+
+        if (!triggerHeld)
+        {
+            _isDraggingModel = false;
+            return;
+        }
+
+        Transform pointer = rightControllerAnchor != null ? rightControllerAnchor : centerEyeAnchor;
+        Transform currentModel = modelLoader.CurrentModelTransform;
+        if (pointer == null || currentModel == null)
+            return;
+
+        if (!_isDraggingModel)
+        {
+            _isDraggingModel = true;
+            float startDistance = Vector3.Distance(pointer.position, currentModel.position);
+            if (startDistance < 0.05f)
+                startDistance = modelDragFallbackDistance;
+
+            _modelDragDistance = Mathf.Clamp(
+                startDistance,
+                0.35f,
+                3f
+            );
+        }
+
+        Vector2 distanceAxis = OVRInput.Get(OVRInput.RawAxis2D.RThumbstick);
+        if (Mathf.Abs(distanceAxis.y) > stickDeadzone)
+            _modelDragDistance = Mathf.Clamp(
+                _modelDragDistance + distanceAxis.y * modelDragDistanceSpeed * Time.deltaTime,
+                0.25f,
+                4f
+            );
+
+        Vector3 targetPosition = pointer.position + pointer.forward * Mathf.Max(0.1f, _modelDragDistance);
+        if (Physics.Raycast(pointer.position, pointer.forward, out RaycastHit hit, 5f, placementMask, QueryTriggerInteraction.Ignore)
+            && !modelLoader.IsPartOfCurrentModel(hit.transform))
+        {
+            targetPosition = hit.point + hit.normal * previewSurfaceOffset;
+        }
+
+        modelLoader.MoveCurrentModelTo(targetPosition, currentModel.rotation);
+    }
+
+    private static bool GetButtonDown(OVRInput.Button button, OVRInput.RawButton rawButton, OVRInput.Controller controller)
+    {
+        return OVRInput.GetDown(button)
+               || OVRInput.GetDown(button, controller)
+               || OVRInput.GetDown(rawButton);
+    }
+
+    private void SetPreviewVisible(bool visible)
+    {
+        if (previewCanvas != null)
+            previewCanvas.gameObject.SetActive(visible);
+    }
+
+    private bool IsCropSelectionActive(bool requestRunning)
+    {
+        return useCropBoundary
+               && _pendingCapture != null
+               && !_hasGeneratedModelForPendingCapture
+               && !requestRunning;
+    }
+
+    private string BuildControlHint()
+    {
+        if (_submitting || (apiClient != null && apiClient.IsSending))
+            return "Generating model...\nPlease wait";
+
+        if (IsCropSelectionActive(false))
+            return "A Retake | B Generate | Y Clear\nRight stick move crop | Left stick resize";
+
+        if (modelLoader != null && modelLoader.HasCurrentModel)
+            return "Trigger drag/drop | Left stick scale/rotate\nX Save | Y Remove | A New";
+
+        return "A Capture\nMove hands away before the countdown ends";
+    }
+
+    private void LogDebug(string message)
+    {
+        if (verboseDebugLogging)
+            Debug.Log($"[SnapshotCapture][Trace] {message}");
+    }
+
+    private void ApplyPreviewImageOrientation()
+    {
+        if (previewImage == null)
+            return;
+
+        previewImage.uvRect = flipPreviewImageVertically
+            ? new Rect(0f, 1f, 1f, -1f)
+            : new Rect(0f, 0f, 1f, 1f);
+    }
+
+    private void EnsureCropFrame()
+    {
+        if (previewImage == null)
+            return;
+
+        if (cropFrame == null)
+        {
+            GameObject frameObject = new GameObject("CropBoundary", typeof(RectTransform));
+            frameObject.transform.SetParent(previewImage.transform, false);
+            cropFrame = frameObject.GetComponent<RectTransform>();
+            cropFrame.anchorMin = new Vector2(0.5f, 0.5f);
+            cropFrame.anchorMax = new Vector2(0.5f, 0.5f);
+            cropFrame.pivot = new Vector2(0.5f, 0.5f);
+        }
+
+        EnsureCropBorder(0, "Top");
+        EnsureCropBorder(1, "Bottom");
+        EnsureCropBorder(2, "Left");
+        EnsureCropBorder(3, "Right");
+        UpdateCropFrame();
+    }
+
+    private void EnsureCropBorder(int index, string name)
+    {
+        if (_cropBorders[index] != null)
+            return;
+
+        Transform existing = cropFrame.Find(name);
+        if (existing != null && existing.TryGetComponent(out Image image))
+        {
+            _cropBorders[index] = image;
+            image.color = cropBorderColor;
+            return;
+        }
+
+        _cropBorders[index] = CreateCropBorder(cropFrame, name, cropBorderColor);
+    }
+
+    private static Image CreateCropBorder(RectTransform parent, string name, Color color)
+    {
+        GameObject borderObject = new GameObject(name, typeof(RectTransform), typeof(Image));
+        borderObject.transform.SetParent(parent, false);
+
+        Image image = borderObject.GetComponent<Image>();
+        image.color = color;
+        return image;
+    }
+
+    private void EnsureInstructionTitle()
+    {
+        if (previewPanel == null)
+            return;
+
+        if (appTitleText == null)
+        {
+            GameObject titleObject = new GameObject("ScanSpaceTitle", typeof(RectTransform), typeof(TextMeshProUGUI));
+            titleObject.transform.SetParent(previewPanel.transform, false);
+            appTitleText = titleObject.GetComponent<TMP_Text>();
+            appTitleText.alignment = TextAlignmentOptions.Center;
+            appTitleText.color = Color.white;
+            appTitleText.fontStyle = FontStyles.Bold;
+        }
+
+        RectTransform titleRect = appTitleText.rectTransform;
+        titleRect.anchorMin = new Vector2(0f, 1f);
+        titleRect.anchorMax = new Vector2(1f, 1f);
+        titleRect.pivot = new Vector2(0.5f, 1f);
+        titleRect.offsetMin = titleOffsetMin;
+        titleRect.offsetMax = titleOffsetMax;
+    }
+
+    private void ApplyPreviewImageLayout()
+    {
+        if (previewImage == null)
+            return;
+
+        RectTransform imageRect = previewImage.rectTransform;
+        imageRect.anchorMin = new Vector2(0.5f, 1f);
+        imageRect.anchorMax = new Vector2(0.5f, 1f);
+        imageRect.pivot = new Vector2(0.5f, 1f);
+        imageRect.sizeDelta = previewImageSize;
+        imageRect.anchoredPosition = previewImageAnchoredPosition;
+    }
+
+    private void ApplyStatusTextLayout()
+    {
+        if (previewStatusText == null)
+            return;
+
+        previewStatusText.fontSize = statusFontSize;
+        previewStatusText.alignment = TextAlignmentOptions.Center;
+
+        RectTransform textRect = previewStatusText.rectTransform;
+        textRect.anchorMin = new Vector2(0f, 0f);
+        textRect.anchorMax = new Vector2(1f, 0f);
+        textRect.pivot = new Vector2(0.5f, 0f);
+        textRect.offsetMin = statusOffsetMin;
+        textRect.offsetMax = statusOffsetMax;
+        textRect.sizeDelta = new Vector2(0f, statusHeight);
+    }
+
+    private void UpdateCropFrame()
+    {
+        if (cropFrame == null || previewImage == null)
+            return;
+
+        RectTransform imageRect = previewImage.rectTransform;
+        Vector2 imageSize = imageRect.rect.size;
+        if (imageSize.x <= 0f || imageSize.y <= 0f)
+            imageSize = imageRect.sizeDelta;
+
+        cropFrame.sizeDelta = new Vector2(imageSize.x * _cropSize.x, imageSize.y * _cropSize.y);
+        cropFrame.anchoredPosition = new Vector2(
+            (_cropCenter.x - 0.5f) * imageSize.x,
+            (_cropCenter.y - 0.5f) * imageSize.y
+        );
+
+        const float thickness = 4f;
+        SetCropBorderRect(_cropBorders[0], new Vector2(0f, 1f), new Vector2(1f, 1f), new Vector2(0f, thickness), Vector2.zero);
+        SetCropBorderRect(_cropBorders[1], new Vector2(0f, 0f), new Vector2(1f, 0f), new Vector2(0f, thickness), Vector2.zero);
+        SetCropBorderRect(_cropBorders[2], new Vector2(0f, 0f), new Vector2(0f, 1f), new Vector2(thickness, 0f), Vector2.zero);
+        SetCropBorderRect(_cropBorders[3], new Vector2(1f, 0f), new Vector2(1f, 1f), new Vector2(thickness, 0f), Vector2.zero);
+
+        SetCropFrameVisible(IsCropSelectionActive(_submitting || (apiClient != null && apiClient.IsSending)));
+    }
+
+    private static void SetCropBorderRect(Image border, Vector2 anchorMin, Vector2 anchorMax, Vector2 sizeDelta, Vector2 anchoredPosition)
+    {
+        if (border == null)
+            return;
+
+        RectTransform rect = border.rectTransform;
+        rect.anchorMin = anchorMin;
+        rect.anchorMax = anchorMax;
+        rect.pivot = new Vector2(0.5f, 0.5f);
+        rect.sizeDelta = sizeDelta;
+        rect.anchoredPosition = anchoredPosition;
+    }
+
+    private void SetCropFrameVisible(bool visible)
+    {
+        if (cropFrame != null)
+            cropFrame.gameObject.SetActive(visible);
+    }
+
+    private void ResetCropBoundary()
+    {
+        _cropCenter = defaultCropCenter;
+        _cropSize = defaultCropSize;
+        ClampCropBoundary();
+    }
+
+    private void ClampCropBoundary()
+    {
+        float safeMin = Mathf.Clamp(minCropSize, 0.05f, 1f);
+        _cropSize.x = Mathf.Clamp(_cropSize.x, safeMin, 1f);
+        _cropSize.y = Mathf.Clamp(_cropSize.y, safeMin, 1f);
+        _cropCenter.x = Mathf.Clamp(_cropCenter.x, _cropSize.x * 0.5f, 1f - _cropSize.x * 0.5f);
+        _cropCenter.y = Mathf.Clamp(_cropCenter.y, _cropSize.y * 0.5f, 1f - _cropSize.y * 0.5f);
     }
 
     private static Texture2D CloneTexture(Texture2D source, int maxDimension)
@@ -385,6 +971,88 @@ public class SnapshotCapture : MonoBehaviour
         return clone;
     }
 
+    private Texture2D CreateUploadTexture(Texture2D source)
+    {
+        if (source == null)
+            return null;
+
+        if (!useCropBoundary)
+            return CloneTexture(source, uploadMaxDimension);
+
+        RectInt cropRect = GetCropPixelRect(source);
+        Texture2D cropped = CropTexture(source, cropRect);
+        if (cropped == null)
+            return CloneTexture(source, uploadMaxDimension);
+
+        Texture2D upload = CloneTexture(cropped, uploadMaxDimension);
+        Destroy(cropped);
+        LogDebug($"Crop upload | rect={cropRect.x},{cropRect.y},{cropRect.width}x{cropRect.height}");
+        return upload;
+    }
+
+    private RectInt GetCropPixelRect(Texture2D source)
+    {
+        ClampCropBoundary();
+
+        int x = Mathf.RoundToInt((_cropCenter.x - _cropSize.x * 0.5f) * source.width);
+        int y = Mathf.RoundToInt((_cropCenter.y - _cropSize.y * 0.5f) * source.height);
+        int width = Mathf.RoundToInt(_cropSize.x * source.width);
+        int height = Mathf.RoundToInt(_cropSize.y * source.height);
+
+        x = Mathf.Clamp(x, 0, source.width - 1);
+        y = Mathf.Clamp(y, 0, source.height - 1);
+        width = Mathf.Clamp(width, 1, source.width - x);
+        height = Mathf.Clamp(height, 1, source.height - y);
+        return new RectInt(x, y, width, height);
+    }
+
+    private static Texture2D CropTexture(Texture2D source, RectInt cropRect)
+    {
+        if (source == null || cropRect.width <= 0 || cropRect.height <= 0)
+            return null;
+
+        var cropped = new Texture2D(cropRect.width, cropRect.height, TextureFormat.RGBA32, false);
+        Color32[] sourcePixels = source.GetPixels32();
+        Color32[] croppedPixels = new Color32[cropRect.width * cropRect.height];
+
+        for (int row = 0; row < cropRect.height; row++)
+        {
+            int sourceIndex = (cropRect.y + row) * source.width + cropRect.x;
+            int targetIndex = row * cropRect.width;
+            System.Array.Copy(sourcePixels, sourceIndex, croppedPixels, targetIndex, cropRect.width);
+        }
+
+        cropped.SetPixels32(croppedPixels);
+        cropped.Apply();
+        return cropped;
+    }
+
+    private static void FlipTextureVerticalInPlace(Texture2D texture)
+    {
+        if (texture == null || texture.width <= 1 || texture.height <= 1)
+            return;
+
+        int width = texture.width;
+        int height = texture.height;
+        Color32[] pixels = texture.GetPixels32();
+
+        for (int y = 0; y < height / 2; y++)
+        {
+            int topRowStart = y * width;
+            int bottomRowStart = (height - 1 - y) * width;
+            for (int x = 0; x < width; x++)
+            {
+                int topIndex = topRowStart + x;
+                int bottomIndex = bottomRowStart + x;
+                Color32 temp = pixels[topIndex];
+                pixels[topIndex] = pixels[bottomIndex];
+                pixels[bottomIndex] = temp;
+            }
+        }
+
+        texture.SetPixels32(pixels);
+    }
+
     private string SaveTextureToDisk(Texture2D texture)
     {
         string directory = Path.Combine(Application.persistentDataPath, captureFolderName);
@@ -397,5 +1065,11 @@ public class SnapshotCapture : MonoBehaviour
 
         Debug.Log($"[SnapshotCapture] Capture saved to: {fullPath}");
         return fullPath;
+    }
+
+    private static Transform FindNamedTransform(string objectName)
+    {
+        GameObject found = GameObject.Find(objectName);
+        return found != null ? found.transform : null;
     }
 }

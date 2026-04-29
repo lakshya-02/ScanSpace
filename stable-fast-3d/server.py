@@ -172,6 +172,10 @@ async def lifespan(app: FastAPI):
     print(f"Selected profile: {RUNTIME_PROFILE.upper()}")
     print(f"Cache enabled: {CACHE_ENABLED}")
     print(f"Cache directory: {CACHE_DIR}")
+    print(
+        "HF local only: "
+        f"{os.getenv('SCANSPACE_HF_LOCAL_ONLY', '1').strip().lower() not in {'0', 'false', 'no', 'off'}}"
+    )
     print(f"Auth enabled: {bool(EXPECTED_BEARER_TOKEN)}")
 
     model = SF3D.from_pretrained(

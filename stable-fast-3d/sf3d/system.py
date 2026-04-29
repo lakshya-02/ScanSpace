@@ -82,15 +82,26 @@ class SF3D(BaseModule):
     def from_pretrained(
         cls, pretrained_model_name_or_path: str, config_name: str, weight_name: str
     ):
+        local_files_only = os.getenv("SCANSPACE_HF_LOCAL_ONLY", "1").strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+
         if os.path.isdir(pretrained_model_name_or_path):
             config_path = os.path.join(pretrained_model_name_or_path, config_name)
             weight_path = os.path.join(pretrained_model_name_or_path, weight_name)
         else:
             config_path = hf_hub_download(
-                repo_id=pretrained_model_name_or_path, filename=config_name
+                repo_id=pretrained_model_name_or_path,
+                filename=config_name,
+                local_files_only=local_files_only,
             )
             weight_path = hf_hub_download(
-                repo_id=pretrained_model_name_or_path, filename=weight_name
+                repo_id=pretrained_model_name_or_path,
+                filename=weight_name,
+                local_files_only=local_files_only,
             )
 
         cfg = OmegaConf.load(config_path)

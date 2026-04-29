@@ -5,7 +5,7 @@ public class ServerConfig : ScriptableObject
 {
     [Header("API Gateway")]
     [Tooltip("Public API base URL. Can be a Cloudflare Tunnel HTTPS URL or local LAN URL.")]
-    public string baseUrl = "http://192.168.0.184:8000";
+    public string baseUrl = "http://192.168.0.182:8000";
 
     [Tooltip("Health endpoint path exposed by the API gateway.")]
     public string healthPath = "/health";
