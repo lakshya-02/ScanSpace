@@ -19,6 +19,10 @@ public class SnapshotCapture : MonoBehaviour
     [SerializeField] private TMP_Text appTitleText;
     [SerializeField] private Transform rightControllerAnchor;
     [SerializeField] private RectTransform cropFrame;
+    [SerializeField] private AudioSource audioSource;
+    [SerializeField] private AudioClip captureSound;
+    [SerializeField] private AudioClip successSound;
+    [SerializeField] private TMP_Text transientMessageText;
 
     [Header("Capture Flow")]
     [SerializeField] private bool autoUploadAfterCapture = false;
@@ -61,10 +65,16 @@ public class SnapshotCapture : MonoBehaviour
     [SerializeField] private float statusHeight = 72f;
     [SerializeField] private Color cropBorderColor = new(0.05f, 0.9f, 1f, 0.95f);
 
+    [Header("Feedback")]
+    [SerializeField] private bool useGeneratedFallbackSounds = true;
+    [SerializeField] private float transientMessageSeconds = 1.4f;
+    [SerializeField] private float transientFadeSeconds = 0.35f;
+
     [Header("Model Controls")]
     [SerializeField] private float stickDeadzone = 0.18f;
     [SerializeField] private float modelMoveSpeed = 0.65f;
     [SerializeField] private float modelRotateSpeed = 90f;
+    [SerializeField] private float modelPitchRollSpeed = 70f;
     [SerializeField] private float modelScaleSpeed = 0.9f;
     [SerializeField] private float modelDragTriggerThreshold = 0.1f;
     [SerializeField] private float modelDragFallbackDistance = 1.1f;
@@ -80,6 +90,7 @@ public class SnapshotCapture : MonoBehaviour
     private bool _hasGeneratedModelForPendingCapture;
     private bool _isDraggingModel;
     private float _modelDragDistance;
+    private Coroutine _transientMessageCoroutine;
 
     public string LastCapturePath { get; private set; }
 
@@ -96,13 +107,19 @@ public class SnapshotCapture : MonoBehaviour
         ResolveReferences();
 
         if (apiClient != null)
+        {
             apiClient.StatusChanged += HandleApiStatusChanged;
+            apiClient.ModelSavedLocally += HandleModelSavedLocally;
+        }
     }
 
     private void OnDisable()
     {
         if (apiClient != null)
+        {
             apiClient.StatusChanged -= HandleApiStatusChanged;
+            apiClient.ModelSavedLocally -= HandleModelSavedLocally;
+        }
     }
 
     private void Update()
@@ -214,18 +231,21 @@ public class SnapshotCapture : MonoBehaviour
         if (passthroughCamera == null)
         {
             Debug.LogError("[SnapshotCapture] PassthroughCameraAccess reference is not assigned.");
+            UpdatePreviewState("Passthrough camera missing.");
             return;
         }
 
         if (autoUploadAfterCapture && apiClient == null)
         {
             Debug.LogError("[SnapshotCapture] APIClient reference is not assigned, but auto upload is enabled.");
+            UpdatePreviewState("API client missing. Cannot upload.");
             return;
         }
 
         if (!passthroughCamera.IsPlaying)
         {
             Debug.LogWarning("[SnapshotCapture] Passthrough camera is not playing yet.");
+            UpdatePreviewState("Camera not ready yet. Try again.");
             return;
         }
 
@@ -238,12 +258,23 @@ public class SnapshotCapture : MonoBehaviour
             if (texture == null)
                 return;
 
+            PlayFeedbackSound(captureSound);
             LogDebug($"Capture ready | {texture.width}x{texture.height} fmt={texture.format}");
 
             SetPendingCapture(texture);
 
             if (saveCaptureToDisk)
-                LastCapturePath = SaveTextureToDisk(texture);
+            {
+                try
+                {
+                    LastCapturePath = SaveTextureToDisk(texture);
+                }
+                catch (System.Exception saveException)
+                {
+                    Debug.LogWarning($"[SnapshotCapture] Capture preview could not be saved to disk: {saveException.Message}");
+                    LogDebug($"Capture disk save skipped | {saveException.Message}");
+                }
+            }
 
             bool shouldSubmitImmediately = apiClient != null && autoUploadAfterCapture;
             LogDebug(
@@ -315,7 +346,7 @@ public class SnapshotCapture : MonoBehaviour
         LogDebug($"Prepared upload texture | {sendTexture.width}x{sendTexture.height} fmt={sendTexture.format}");
 
         _submitting = true;
-        UpdatePreviewState($"Sending preview to the server ({sendTexture.width}x{sendTexture.height})...");
+        UpdatePreviewState("Generating 3D...");
         apiClient.SendImage(sendTexture, HandleSubmitCompleted);
     }
 
@@ -335,6 +366,25 @@ public class SnapshotCapture : MonoBehaviour
 
         if (rightControllerAnchor == null)
             rightControllerAnchor = FindNamedTransform("RightControllerAnchor") ?? FindNamedTransform("RightHandAnchor");
+
+        if (audioSource == null)
+            audioSource = GetComponent<AudioSource>();
+
+        if (audioSource == null)
+        {
+            audioSource = gameObject.AddComponent<AudioSource>();
+            audioSource.playOnAwake = false;
+            audioSource.spatialBlend = 0f;
+        }
+
+        if (useGeneratedFallbackSounds)
+        {
+            if (captureSound == null)
+                captureSound = CreateToneClip("ScanSpaceCaptureTone", 740f, 0.08f, 0.16f);
+
+            if (successSound == null)
+                successSound = CreateToneClip("ScanSpaceSuccessTone", 980f, 0.12f, 0.18f);
+        }
     }
 
     private Texture2D CaptureTexture()
@@ -398,9 +448,13 @@ public class SnapshotCapture : MonoBehaviour
         _hasGeneratedModelForPendingCapture = success;
         LogDebug($"Submit completed | success={success}");
         UpdateCropFrame();
+
+        if (success)
+            PlayFeedbackSound(successSound);
+
         UpdatePreviewState(
             success
-                ? "Model ready. Hold trigger to drag. Left stick resizes."
+                ? "Model ready. Hold trigger to drag."
                 : "Send failed. Press A to recapture."
         );
     }
@@ -410,6 +464,12 @@ public class SnapshotCapture : MonoBehaviour
         LogDebug($"API status | {message}");
         if (_submitting || (apiClient != null && apiClient.IsSending))
             UpdatePreviewState(message);
+    }
+
+    private void HandleModelSavedLocally(string modelPath)
+    {
+        LogDebug($"Model saved locally | {modelPath}");
+        ShowTransientMessage("Saved locally");
     }
 
     private void EnsurePreviewUI()
@@ -467,11 +527,12 @@ public class SnapshotCapture : MonoBehaviour
 
             previewStatusText = textObject.GetComponent<TMP_Text>();
             previewStatusText.color = Color.white;
-            previewStatusText.enableWordWrapping = true;
+            previewStatusText.textWrappingMode = TextWrappingModes.Normal;
             previewStatusText.overflowMode = TextOverflowModes.Ellipsis;
         }
 
         ApplyStatusTextLayout();
+        EnsureTransientMessageText();
 
         if (appTitleText != null)
         {
@@ -606,6 +667,9 @@ public class SnapshotCapture : MonoBehaviour
         }
 
         bool saved = apiClient.SaveLatestGeneratedModelToDisk();
+        if (saved)
+            ShowTransientMessage("Saved locally");
+
         UpdatePreviewState(
             saved
                 ? "Model saved on device."
@@ -615,7 +679,7 @@ public class SnapshotCapture : MonoBehaviour
 
     private void UpdateModelStickControls()
     {
-        if (IsCropSelectionActive(false) || _isDraggingModel)
+        if (IsCropSelectionActive(false))
             return;
 
         if (modelLoader == null || !modelLoader.HasCurrentModel || (apiClient != null && apiClient.IsSending))
@@ -624,7 +688,7 @@ public class SnapshotCapture : MonoBehaviour
         Vector2 moveAxis = OVRInput.Get(OVRInput.RawAxis2D.RThumbstick);
         Vector2 adjustAxis = OVRInput.Get(OVRInput.RawAxis2D.LThumbstick);
 
-        if (moveAxis.sqrMagnitude > stickDeadzone * stickDeadzone)
+        if (!_isDraggingModel && moveAxis.sqrMagnitude > stickDeadzone * stickDeadzone)
         {
             Transform basis = centerEyeAnchor != null ? centerEyeAnchor : transform;
             Vector3 forward = Vector3.ProjectOnPlane(basis.forward, Vector3.up).normalized;
@@ -633,13 +697,32 @@ public class SnapshotCapture : MonoBehaviour
             modelLoader.NudgeCurrentModel(delta);
         }
 
-        if (Mathf.Abs(adjustAxis.x) > stickDeadzone)
-            modelLoader.RotateCurrentModel(adjustAxis.x * modelRotateSpeed * Time.deltaTime);
+        bool pitchRollMode =
+            OVRInput.Get(OVRInput.RawAxis1D.LHandTrigger) > 0.35f ||
+            OVRInput.Get(OVRInput.Button.PrimaryHandTrigger, OVRInput.Controller.LTouch);
 
-        if (Mathf.Abs(adjustAxis.y) > stickDeadzone)
+        if (pitchRollMode)
         {
-            float multiplier = 1f + adjustAxis.y * modelScaleSpeed * Time.deltaTime;
-            modelLoader.ScaleCurrentModel(Mathf.Max(0.01f, multiplier));
+            Transform modelTransform = modelLoader.CurrentModelTransform;
+            if (modelTransform == null)
+                return;
+
+            if (Mathf.Abs(adjustAxis.y) > stickDeadzone)
+                modelLoader.RotateCurrentModel(modelTransform.right, -adjustAxis.y * modelPitchRollSpeed * Time.deltaTime, Space.World);
+
+            if (Mathf.Abs(adjustAxis.x) > stickDeadzone)
+                modelLoader.RotateCurrentModel(modelTransform.forward, -adjustAxis.x * modelPitchRollSpeed * Time.deltaTime, Space.World);
+        }
+        else
+        {
+            if (Mathf.Abs(adjustAxis.x) > stickDeadzone)
+                modelLoader.RotateCurrentModel(adjustAxis.x * modelRotateSpeed * Time.deltaTime);
+
+            if (Mathf.Abs(adjustAxis.y) > stickDeadzone)
+            {
+                float multiplier = 1f + adjustAxis.y * modelScaleSpeed * Time.deltaTime;
+                modelLoader.ScaleCurrentModel(Mathf.Max(0.01f, multiplier));
+            }
         }
     }
 
@@ -688,6 +771,9 @@ public class SnapshotCapture : MonoBehaviour
 
         if (!triggerHeld)
         {
+            if (_isDraggingModel)
+                modelLoader.FlushCurrentModelState();
+
             _isDraggingModel = false;
             return;
         }
@@ -759,7 +845,7 @@ public class SnapshotCapture : MonoBehaviour
             return "A Retake | B Generate | Y Clear\nRight stick move crop | Left stick resize";
 
         if (modelLoader != null && modelLoader.HasCurrentModel)
-            return "Trigger drag/drop | Left stick scale/rotate\nX Save | Y Remove | A New";
+            return "Trigger drag | R stick move | L stick yaw/scale\nHold L grip: pitch/roll | X Save | Y Remove";
 
         return "A Capture\nMove hands away before the countdown ends";
     }
@@ -879,6 +965,103 @@ public class SnapshotCapture : MonoBehaviour
         textRect.offsetMin = statusOffsetMin;
         textRect.offsetMax = statusOffsetMax;
         textRect.sizeDelta = new Vector2(0f, statusHeight);
+    }
+
+    private void EnsureTransientMessageText()
+    {
+        if (previewPanel == null)
+            return;
+
+        if (transientMessageText == null)
+        {
+            GameObject textObject = new GameObject("ScanSpaceTransientMessage", typeof(RectTransform), typeof(TextMeshProUGUI));
+            textObject.transform.SetParent(previewPanel.transform, false);
+
+            transientMessageText = textObject.GetComponent<TMP_Text>();
+            transientMessageText.alignment = TextAlignmentOptions.Center;
+            transientMessageText.fontStyle = FontStyles.Bold;
+            transientMessageText.fontSize = statusFontSize;
+            transientMessageText.text = string.Empty;
+            transientMessageText.color = new Color(0.72f, 1f, 0.78f, 0f);
+            transientMessageText.raycastTarget = false;
+        }
+
+        RectTransform textRect = transientMessageText.rectTransform;
+        textRect.anchorMin = new Vector2(0.5f, 0f);
+        textRect.anchorMax = new Vector2(0.5f, 0f);
+        textRect.pivot = new Vector2(0.5f, 0f);
+        textRect.anchoredPosition = new Vector2(0f, statusHeight + 18f);
+        textRect.sizeDelta = new Vector2(360f, 44f);
+    }
+
+    private void PlayFeedbackSound(AudioClip clip)
+    {
+        if (clip == null)
+            return;
+
+        ResolveReferences();
+        if (audioSource != null)
+            audioSource.PlayOneShot(clip);
+    }
+
+    private static AudioClip CreateToneClip(string clipName, float frequency, float durationSeconds, float volume)
+    {
+        const int sampleRate = 24000;
+        int sampleCount = Mathf.Max(1, Mathf.RoundToInt(sampleRate * durationSeconds));
+        float[] samples = new float[sampleCount];
+
+        for (int i = 0; i < sampleCount; i++)
+        {
+            float t = i / (float)sampleRate;
+            float envelope = 1f - i / (float)sampleCount;
+            samples[i] = Mathf.Sin(2f * Mathf.PI * frequency * t) * volume * envelope;
+        }
+
+        AudioClip clip = AudioClip.Create(clipName, sampleCount, 1, sampleRate, false);
+        clip.SetData(samples, 0);
+        return clip;
+    }
+
+    private void ShowTransientMessage(string message)
+    {
+        EnsurePreviewUI();
+
+        if (transientMessageText == null)
+            return;
+
+        if (_transientMessageCoroutine != null)
+            StopCoroutine(_transientMessageCoroutine);
+
+        _transientMessageCoroutine = StartCoroutine(TransientMessageRoutine(message));
+    }
+
+    private IEnumerator TransientMessageRoutine(string message)
+    {
+        transientMessageText.text = message;
+        transientMessageText.gameObject.SetActive(true);
+
+        Color visible = transientMessageText.color;
+        visible.a = 1f;
+        transientMessageText.color = visible;
+
+        yield return new WaitForSeconds(transientMessageSeconds);
+
+        float fadeDuration = Mathf.Max(0.01f, transientFadeSeconds);
+        float elapsed = 0f;
+        while (elapsed < fadeDuration)
+        {
+            elapsed += Time.deltaTime;
+            Color faded = visible;
+            faded.a = Mathf.Lerp(1f, 0f, Mathf.Clamp01(elapsed / fadeDuration));
+            transientMessageText.color = faded;
+            yield return null;
+        }
+
+        Color hidden = visible;
+        hidden.a = 0f;
+        transientMessageText.color = hidden;
+        transientMessageText.text = string.Empty;
+        _transientMessageCoroutine = null;
     }
 
     private void UpdateCropFrame()

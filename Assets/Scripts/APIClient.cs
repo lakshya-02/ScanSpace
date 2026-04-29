@@ -10,6 +10,7 @@ using Stopwatch = System.Diagnostics.Stopwatch;
 public class APIClient : MonoBehaviour
 {
     public event Action<string> StatusChanged;
+    public event Action<string> ModelSavedLocally;
 
     [Header("References")]
     [SerializeField] private ServerConfig config;
@@ -45,6 +46,7 @@ public class APIClient : MonoBehaviour
     {
         if (texture == null)
         {
+            SetStatus("No image available to send.");
             Debug.LogError("[APIClient] Cannot send a null texture.");
             onCompleted?.Invoke(false);
             return;
@@ -59,6 +61,7 @@ public class APIClient : MonoBehaviour
 
         if (_isSending)
         {
+            SetStatus("Send already in progress. Please wait...");
             Debug.LogWarning("[APIClient] Already sending a request. Ignoring.");
             Destroy(texture);
             onCompleted?.Invoke(false);
@@ -71,6 +74,7 @@ public class APIClient : MonoBehaviour
     private IEnumerator SendImageCoroutine(Texture2D texture, Action<bool> onCompleted)
     {
         _isSending = true;
+        LastSavedModelPath = null;
         SetStatus("Preparing capture...");
         SetLoading(true);
         LogDebug($"SendImage start | source tex: {texture.width}x{texture.height} fmt={texture.format}");
@@ -161,10 +165,11 @@ public class APIClient : MonoBehaviour
             }
         }
 
-        SetStatus(healthOk ? "Sending image to SF3D server..." : "Sending image to SF3D server without preflight...");
+        SetStatus(healthOk ? "Generating 3D..." : "Generating 3D... backend preflight failed, trying anyway.");
 
         var form = new WWWForm();
         form.AddBinaryData("image", imageBytes, uploadFileName, uploadMimeType);
+        LogDebug($"Multipart form ready | field=image | filename={uploadFileName} | contentType={uploadMimeType} | bytes={imageBytes.Length}");
 
         string generateUrl = BuildGenerateUrl();
         using (var generateRequest = UnityWebRequest.Post(generateUrl, form))
@@ -256,8 +261,21 @@ public class APIClient : MonoBehaviour
                 yield break;
             }
 
-            SetStatus("Model loaded!");
-            LogDebug("Model load complete.");
+            bool savedMetadata = false;
+            if (saveGeneratedModelsToDisk && !string.IsNullOrEmpty(LastSavedModelPath))
+                savedMetadata = modelLoader.SaveCurrentModelState(LastSavedModelPath);
+
+            if (savedMetadata)
+            {
+                SetStatus("Model loaded. Saved locally.");
+                ModelSavedLocally?.Invoke(LastSavedModelPath);
+                LogDebug($"Model load complete | metadata saved={LastSavedModelPath}");
+            }
+            else
+            {
+                SetStatus("Model loaded!");
+                LogDebug("Model load complete.");
+            }
         }
 
         CompleteRequest(true, onCompleted);
@@ -265,6 +283,8 @@ public class APIClient : MonoBehaviour
 
     public bool SaveLatestGeneratedModelToDisk()
     {
+        ResolveReferences();
+
         if (!LooksLikeGlb(_lastGeneratedGlbBytes))
         {
             SetStatus("No generated model to save yet.");
@@ -278,6 +298,10 @@ public class APIClient : MonoBehaviour
             SetStatus("Could not save generated model.");
             return false;
         }
+
+        bool savedMetadata = modelLoader != null && modelLoader.SaveCurrentModelState(savedPath);
+        if (savedMetadata)
+            ModelSavedLocally?.Invoke(savedPath);
 
         SetStatus("Model saved on device.");
         return true;
