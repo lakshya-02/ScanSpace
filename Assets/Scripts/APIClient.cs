@@ -458,7 +458,12 @@ public class APIClient : MonoBehaviour
 
     private void ApplyAuthHeader(UnityWebRequest request)
     {
-        if (request == null || config == null || !config.HasBearerToken)
+        if (request == null)
+            return;
+
+        request.SetRequestHeader("ngrok-skip-browser-warning", "true");
+
+        if (config == null || !config.HasBearerToken)
             return;
 
         request.SetRequestHeader("Authorization", $"Bearer {config.bearerToken.Trim()}");
