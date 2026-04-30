@@ -20,7 +20,9 @@ public class SnapshotCapture : MonoBehaviour
     [SerializeField] private Transform rightControllerAnchor;
     [SerializeField] private RectTransform cropFrame;
     [SerializeField] private AudioSource audioSource;
+    [SerializeField] private AudioClip openingSound;
     [SerializeField] private AudioClip captureSound;
+    [SerializeField] private AudioClip generatingSound;
     [SerializeField] private AudioClip successSound;
     [SerializeField] private TMP_Text transientMessageText;
 
@@ -75,6 +77,7 @@ public class SnapshotCapture : MonoBehaviour
     [SerializeField] private float modelMoveSpeed = 0.65f;
     [SerializeField] private float modelRotateSpeed = 90f;
     [SerializeField] private float modelPitchRollSpeed = 70f;
+    [SerializeField] private float rotationModeGripThreshold = 0.25f;
     [SerializeField] private float modelScaleSpeed = 0.9f;
     [SerializeField] private float modelDragTriggerThreshold = 0.1f;
     [SerializeField] private float modelDragFallbackDistance = 1.1f;
@@ -100,6 +103,7 @@ public class SnapshotCapture : MonoBehaviour
         ResetCropBoundary();
         EnsurePreviewUI();
         UpdatePreviewState("Press A to capture an image.");
+        PlayOpeningSound();
     }
 
     private void OnEnable()
@@ -347,6 +351,7 @@ public class SnapshotCapture : MonoBehaviour
 
         _submitting = true;
         UpdatePreviewState("Generating 3D...");
+        PlayGeneratingSound();
         apiClient.SendImage(sendTexture, HandleSubmitCompleted);
     }
 
@@ -448,6 +453,7 @@ public class SnapshotCapture : MonoBehaviour
         _hasGeneratedModelForPendingCapture = success;
         LogDebug($"Submit completed | success={success}");
         UpdateCropFrame();
+        StopGeneratingSound();
 
         if (success)
             PlayFeedbackSound(successSound);
@@ -697,9 +703,7 @@ public class SnapshotCapture : MonoBehaviour
             modelLoader.NudgeCurrentModel(delta);
         }
 
-        bool pitchRollMode =
-            OVRInput.Get(OVRInput.RawAxis1D.LHandTrigger) > 0.35f ||
-            OVRInput.Get(OVRInput.Button.PrimaryHandTrigger, OVRInput.Controller.LTouch);
+        bool pitchRollMode = IsRotationModeHeld();
 
         if (pitchRollMode)
         {
@@ -708,10 +712,10 @@ public class SnapshotCapture : MonoBehaviour
                 return;
 
             if (Mathf.Abs(adjustAxis.y) > stickDeadzone)
-                modelLoader.RotateCurrentModel(modelTransform.right, -adjustAxis.y * modelPitchRollSpeed * Time.deltaTime, Space.World);
+                modelLoader.RotateCurrentModel(Vector3.right, -adjustAxis.y * modelPitchRollSpeed * Time.deltaTime, Space.World);
 
             if (Mathf.Abs(adjustAxis.x) > stickDeadzone)
-                modelLoader.RotateCurrentModel(modelTransform.forward, -adjustAxis.x * modelPitchRollSpeed * Time.deltaTime, Space.World);
+                modelLoader.RotateCurrentModel(Vector3.forward, -adjustAxis.x * modelPitchRollSpeed * Time.deltaTime, Space.World);
         }
         else
         {
@@ -724,6 +728,24 @@ public class SnapshotCapture : MonoBehaviour
                 modelLoader.ScaleCurrentModel(Mathf.Max(0.01f, multiplier));
             }
         }
+    }
+
+    private bool IsRotationModeHeld()
+    {
+        float leftGrip = Mathf.Max(
+            OVRInput.Get(OVRInput.Axis1D.PrimaryHandTrigger, OVRInput.Controller.LTouch),
+            OVRInput.Get(OVRInput.RawAxis1D.LHandTrigger)
+        );
+
+        float rightGrip = Mathf.Max(
+            OVRInput.Get(OVRInput.Axis1D.PrimaryHandTrigger, OVRInput.Controller.RTouch),
+            OVRInput.Get(OVRInput.RawAxis1D.RHandTrigger)
+        );
+
+        return leftGrip > rotationModeGripThreshold
+               || rightGrip > rotationModeGripThreshold
+               || OVRInput.Get(OVRInput.Button.PrimaryHandTrigger)
+               || OVRInput.Get(OVRInput.Button.SecondaryHandTrigger);
     }
 
     private void UpdateCropBoxControls(bool requestRunning)
@@ -871,15 +893,24 @@ public class SnapshotCapture : MonoBehaviour
         if (previewImage == null)
             return;
 
-        if (cropFrame == null)
+        bool needsRuntimeFrame = cropFrame == null
+                                 || cropFrame.transform.parent != previewImage.transform
+                                 || !cropFrame.gameObject.scene.IsValid();
+
+        if (needsRuntimeFrame)
         {
+            for (int i = 0; i < _cropBorders.Length; i++)
+                _cropBorders[i] = null;
+
             GameObject frameObject = new GameObject("CropBoundary", typeof(RectTransform));
             frameObject.transform.SetParent(previewImage.transform, false);
             cropFrame = frameObject.GetComponent<RectTransform>();
-            cropFrame.anchorMin = new Vector2(0.5f, 0.5f);
-            cropFrame.anchorMax = new Vector2(0.5f, 0.5f);
-            cropFrame.pivot = new Vector2(0.5f, 0.5f);
         }
+
+        cropFrame.SetParent(previewImage.transform, false);
+        cropFrame.anchorMin = new Vector2(0.5f, 0.5f);
+        cropFrame.anchorMax = new Vector2(0.5f, 0.5f);
+        cropFrame.pivot = new Vector2(0.5f, 0.5f);
 
         EnsureCropBorder(0, "Top");
         EnsureCropBorder(1, "Bottom");
@@ -1002,6 +1033,43 @@ public class SnapshotCapture : MonoBehaviour
         ResolveReferences();
         if (audioSource != null)
             audioSource.PlayOneShot(clip);
+    }
+
+    private void PlayOpeningSound()
+    {
+        ResolveReferences();
+
+        if (openingSound != null)
+        {
+            PlayFeedbackSound(openingSound);
+            return;
+        }
+
+        if (audioSource != null && audioSource.clip != null)
+            audioSource.Play();
+    }
+
+    private void PlayGeneratingSound()
+    {
+        if (generatingSound == null)
+            return;
+
+        ResolveReferences();
+        if (audioSource == null)
+            return;
+
+        audioSource.clip = generatingSound;
+        audioSource.loop = true;
+        audioSource.Play();
+    }
+
+    private void StopGeneratingSound()
+    {
+        if (audioSource == null || audioSource.clip != generatingSound)
+            return;
+
+        audioSource.Stop();
+        audioSource.loop = false;
     }
 
     private static AudioClip CreateToneClip(string clipName, float frequency, float durationSeconds, float volume)
