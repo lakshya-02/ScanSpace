@@ -77,10 +77,11 @@ __pycache__/
 *.pyc
 *.pyo
 
-# Local backend outputs
-stable-fast-3d/output/
-stable-fast-3d/load/
-stable-fast-3d/model.glb
+# Private backend / generated outputs
+stable-fast-3d/
+private-pipeline/
+backend-private/
+*.glb
 
 # OS files
 .DS_Store

@@ -1,16 +1,39 @@
 # ScanSpace
 
-ScanSpace is a Meta Quest 3 mixed reality app that turns a real-world object into an interactive 3D model. Point the headset at an object, capture an image, send it to the local Stable Fast 3D server, and place the generated model back into MR space.
+ScanSpace is a Meta Quest 3 mixed reality concept that turns a real-world object into an interactive 3D model inside your space. The public version of this repository is kept intentionally conceptual: it documents the experience, Unity-facing interaction flow, and demo, while the full AI generation pipeline is kept private for closed-source development.
 
-## What It Does
+## Demo
 
-- Captures a passthrough camera image on Meta Quest 3.
-- Lets the user crop the object before generation.
-- Sends the image to a FastAPI Stable Fast 3D backend.
-- Receives a generated `.glb` model.
-- Places the model in mixed reality.
-- Supports dragging, moving, rotating, scaling, removing, and saving the generated model locally.
-- Restores the latest saved model on app restart.
+[![Watch the ScanSpace demo](https://img.youtube.com/vi/fjbvRinMEPQ/maxresdefault.jpg)](https://www.youtube.com/watch?v=fjbvRinMEPQ)
+
+Watch on YouTube: https://www.youtube.com/watch?v=fjbvRinMEPQ
+
+## Concept
+
+1. Capture a passthrough image on Meta Quest 3.
+2. Crop the real-world object from the headset view.
+3. Send the cropped image to a private 3D generation pipeline.
+4. Receive a generated `.glb` model.
+5. Place, move, rotate, scale, remove, and save the model in mixed reality.
+
+## Public Repo Scope
+
+This repository is meant to show the idea, interaction model, and Unity-side mixed reality experience without exposing the private model-generation backend.
+
+Included:
+
+- Unity project structure for the ScanSpace MR concept.
+- Meta Quest 3 passthrough capture flow.
+- Conceptual client-side model placement and manipulation flow.
+- Demo video and project overview.
+
+Not included:
+
+- The production AI model-generation pipeline.
+- Backend server implementation.
+- Private setup scripts, model weights, local outputs, or deployment details.
+
+For a complete closed-source build, create a separate private repository that contains the full configured project and the private generation pipeline.
 
 ## Controls
 
@@ -27,72 +50,12 @@ ScanSpace is a Meta Quest 3 mixed reality app that turns a real-world object int
 - `X`: Save generated model locally.
 - `Y`: Remove model or clear preview.
 
-## Backend
-
-The backend is in:
-
-```text
-stable-fast-3d/
-```
-
-Start the LAN server:
-
-```powershell
-cd stable-fast-3d
-.\start_server_lan.bat
-```
-
-The Unity app reads the server URL from:
-
-```text
-Assets/ServerConfig.asset
-```
-
-For local Quest testing, set `baseUrl` to the PC LAN address, for example:
-
-```text
-http://192.168.0.182:8000
-```
-
-Health check:
-
-```text
-http://192.168.0.182:8000/health
-```
-
-## Unity Setup
-
-Important scene references:
-
-- `SnapshotCapture`
-  - `APIClient`
-  - `ModelLoader`
-  - `PassthroughCameraAccess`
-  - `CenterEyeAnchor`
-  - Preview canvas/image/status text
-  - Audio source and clips
-
-- `APIClient`
-  - `ServerConfig`
-  - `ModelLoader`
-  - Optional status text/loading indicator
-
-- `ModelLoader`
-  - `CenterEyeAnchor`
-
-Audio slots in `SnapshotCapture`:
-
-- `Opening Sound`
-- `Capture Sound`
-- `Generating Sound`
-- `Success Sound`
-
 ## Build Notes
 
 - Target device: Meta Quest 3.
-- Keep the FastAPI server running while using the APK.
-- Quest and PC must be on the same Wi-Fi for LAN mode.
-- If using a tunnel such as ngrok, update `Assets/ServerConfig.asset` before building.
+- This public repository is not a full production build because the private generation pipeline is excluded.
+- Connect the Unity client to your own compatible backend if you are developing a private end-to-end version.
+- Keep private backend credentials, model weights, generated outputs, and deployment scripts out of the public repository.
 
 ## Team
 
@@ -103,6 +66,6 @@ Note: commits or activity under the name `yeshwanth` were also made by Lakshya S
 
 ## Contact
 
-Lakshya Singh
-Email: lakshya.singh2706@gmail.com
+Lakshya Singh  
+Email: lakshya.singh2706@gmail.com  
 GitHub: [lakshya-02](https://github.com/lakshya-02)
