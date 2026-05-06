@@ -1,0 +1,9 @@
+{
+  "dependencies": {
+    "com.unity.inputsystem": "1.19.0",
+    "com.unity.xr.management": "4.5.4",
+    "com.unity.xr.openxr": "1.16.1",
+    "com.unity.render-pipelines.universal": "17.0.4",
+    "com.unity.cloud.gltfast": "6.16.1"
+  }
+}
