@@ -77,10 +77,6 @@ Not included:
 - Generated `.glb` files.
 - Local build artifacts.
 
-## Team
-
-- Lakshya Singh
-- Ayush Kumar
 
 ## Contact
 
